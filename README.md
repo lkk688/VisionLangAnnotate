@@ -49,3 +49,30 @@ git add .
 git commit -m "Initial setup: FastAPI + React + Docs"
 git push origin main
 ```
+
+Dockerize: backend/Dockerfile
+Backend: Deploy FastAPI (Render, Railway).
+Frontend: Deploy React (Vercel, Netlify).
+
+## File Structure
+
+annotation-tool/
+├── backend/
+│   ├── src/
+│   │   ├── main.py         # FastAPI app
+│   │   └── api/            # API routes
+│   ├── requirements.txt
+│   └── Dockerfile
+├── frontend/
+│   ├── src/
+│   │   ├── App.jsx         # React app
+│   │   └── components/
+│   ├── package.json
+│   └── vite.config.js
+├── docs/
+│   ├── getting-started.md
+│   └── api-reference.md
+├── pyproject.toml          # Python packaging
+├── README.md
+├── .gitignore
+└── LICENSE

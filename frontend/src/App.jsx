@@ -1,16 +1,28 @@
 import { useState, useEffect } from 'react';
+import ImageDisplay from './components/ImageDisplay';
 
 function App() {
-  const [message, setMessage] = useState('');
+  // Fetch this from your backend API (/api/images) or state
+  const imageUrl = "http://localhost:8000/static/uploads/test.jpg";
 
-  useEffect(() => {
-    fetch('http://localhost:8000')
-      .then((res) => res.json())
-      .then((data) => setMessage(data.message));
-  }, []);
-
-  return <h1>{message || "Loading..."}</h1>;
+  return (
+    <div>
+      <h1>My Annotation Tool</h1>
+      <ImageDisplay imageUrl={imageUrl} />
+    </div>
+  );
 }
+// function App() {
+//   const [message, setMessage] = useState('');
+
+//   useEffect(() => {
+//     fetch('http://localhost:8000')
+//       .then((res) => res.json())
+//       .then((data) => setMessage(data.message));
+//   }, []);
+
+//   return <h1>{message || "Loading..."}</h1>;
+// }
 
 export default App;
 
