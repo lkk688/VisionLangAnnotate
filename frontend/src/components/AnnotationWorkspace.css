@@ -1,0 +1,79 @@
+.annotation-workspace {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    position: relative;
+    overflow: hidden;
+  }
+  
+  .workspace-header {
+    padding: 1rem;
+    border-bottom: 1px solid #dee2e6;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+  }
+  
+  .workspace-actions {
+    display: flex;
+    align-items: center;
+  }
+  
+  .workspace-content {
+    flex: 1;
+    display: flex;
+    overflow: hidden;
+  }
+  
+  .canvas-container {
+    flex: 1;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    background-color: #e9ecef;
+    overflow: hidden;
+  }
+  
+  .no-image-placeholder {
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    height: 100%;
+    width: 100%;
+    color: #6c757d;
+  }
+  
+  .annotation-panel {
+    width: 300px;
+    height: 100%;
+    border-left: 1px solid #dee2e6;
+    display: flex;
+    flex-direction: column;
+    background-color: #f8f9fa;
+  }
+  
+  .annotation-list-container {
+    flex: 1;
+    padding: 1rem;
+    border-bottom: 1px solid #dee2e6;
+    overflow-y: auto;
+  }
+  
+  .annotation-details-container {
+    flex: 1;
+    padding: 1rem;
+    overflow-y: auto;
+  }
+  
+  .loading-overlay {
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    background-color: rgba(255, 255, 255, 0.7);
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    z-index: 1000;
+  }

@@ -30,6 +30,11 @@ npm install
 npm run dev
 ```
 
+```bash
+npm install @vitejs/plugin-react --save-dev
+npm install react-router-dom
+```
+
 Documents
 ```bash
 pip install mkdocs mkdocs-material

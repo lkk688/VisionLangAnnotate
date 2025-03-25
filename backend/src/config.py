@@ -25,3 +25,6 @@ print("UPLOAD_FOLDER:", UPLOAD_FOLDER)
 # Create directories if they don't exist
 UPLOAD_FOLDER.mkdir(parents=True, exist_ok=True)
 ANNOTATION_FOLDER.mkdir(parents=True, exist_ok=True)
+
+def allowed_file(filename):
+    return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
