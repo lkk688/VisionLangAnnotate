@@ -1,0 +1,5 @@
+site_name: ImageLangAnnotate
+theme: material
+nav:
+  - Home: getting-started.md
+  - API: api-reference.md
