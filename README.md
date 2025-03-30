@@ -13,6 +13,17 @@ pip install -r requirements.txt
 pip install -e .
 ```
 
+Create Conda virtual environment and install cuda
+```bash
+conda create --name py312 python=3.12
+conda activate py312
+conda info --envs #check existing conda environment
+% conda env list
+$ conda install cuda -c nvidia/label/cuda-12.6
+pip3 install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu126
+pip install mkdocs mkdocs-material
+```
+
 ```bash
 #test backend
 uvicorn src.main:app --reload
