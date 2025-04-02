@@ -252,8 +252,12 @@ def parse_model(d, ch, verbose=True):
 
         m_ = nn.Sequential(*(m(*args) for _ in range(n))) if n > 1 else m(*args)
         t = str(m)[8:-2].replace('__main__.', '')
-        m.np = sum(x.numel() for x in m_.parameters())
-        m_.i, m_.f, m_.type = i, f, t
+        setattr(m_, 'np', sum(x.numel() for x in m_.parameters()))
+        # Store layer info as custom attributes
+        setattr(m_, 'i', i)  # Set layer index using setattr
+        setattr(m_, 'f', f)
+        #m_.f = f  # From layer indices
+        setattr(m_, 'type', t)  # Store layer type name using setattr
         # if verbose:
         #     LOGGER.info(f'{i:>3}{str(f):>20}{n_:>3}{m.np:10.0f}  {t:<45}{str(args):<30}')
         save.extend(x % i for x in ([f] if isinstance(f, int) else f) if x != -1)
@@ -334,9 +338,10 @@ import torch
 
 class YoloImageProcessor(ImageProcessingMixin):
     """
-    Image processor for YOLO models.
+    Image processor for YOLO models with letterbox preprocessing.
     
-    This processor handles image resizing, normalization, and formatting for YOLO models.
+    This processor handles image resizing with letterboxing, normalization, and formatting for YOLO models,
+    ensuring compatibility with the Hugging Face transformers ecosystem.
     """
     
     model_input_names = ["pixel_values"]
@@ -353,6 +358,9 @@ class YoloImageProcessor(ImageProcessingMixin):
         pad_size_divisor=32,
         pad_value=114,
         do_convert_rgb=True,
+        letterbox=True,
+        auto=False,
+        stride=32,
         **kwargs
     ):
         super().__init__(**kwargs)
@@ -366,6 +374,9 @@ class YoloImageProcessor(ImageProcessingMixin):
         self.pad_size_divisor = pad_size_divisor
         self.pad_value = pad_value
         self.do_convert_rgb = do_convert_rgb
+        self.letterbox = letterbox
+        self.auto = auto
+        self.stride = stride
         
     def resize(self, image, size, resample="bilinear"):
         """
@@ -381,14 +392,70 @@ class YoloImageProcessor(ImageProcessingMixin):
             size = (size, size)
             
         resample_map = {
-            "bilinear": Image.BILINEAR,
-            "bicubic": Image.BICUBIC,
-            "nearest": Image.NEAREST,
-            "lanczos": Image.LANCZOS,
+            "bilinear": Image.Resampling.BILINEAR,
+            "bicubic": Image.Resampling.BICUBIC,
+            "nearest": Image.Resampling.NEAREST,
+            "lanczos": Image.Resampling.LANCZOS,
         }
-        resample = resample_map.get(resample, Image.BILINEAR)
+        resample = resample_map.get(resample, Image.Resampling.BILINEAR)
         
-        return image.resize(size, resample)
+        return image.resize(size[::-1], resample)  # PIL uses (width, height)
+    
+    def letterbox_process(self, image, new_shape=(640, 640), color=(114, 114, 114), 
+                  auto=False, scale_fill=False, scaleup=True, stride=32):
+        """
+        Resize and pad image while meeting stride-multiple constraints.
+        
+        Args:
+            image: Input image
+            new_shape: Target shape (height, width)
+            color: Padding color
+            auto: Minimum rectangle
+            scale_fill: Stretch to fill new shape
+            scaleup: Allow scale up
+            stride: Stride for size divisibility
+            
+        Returns:
+            Resized and padded image, and scaling factors
+        """
+        if isinstance(image, Image.Image):
+            image = np.array(image)
+            
+        shape = image.shape[:2]  # current shape [height, width]
+        
+        if isinstance(new_shape, int):
+            new_shape = (new_shape, new_shape)
+            
+        # Scale ratio (new / old)
+        r = min(new_shape[0] / shape[0], new_shape[1] / shape[1])
+        if not scaleup:  # only scale down, do not scale up (for better val mAP)
+            r = min(r, 1.0)
+            
+        # Compute padding
+        ratio = r, r  # width, height ratios
+        new_unpad = int(round(shape[1] * r)), int(round(shape[0] * r))
+        dw, dh = new_shape[1] - new_unpad[0], new_shape[0] - new_unpad[1]  # wh padding
+        
+        if auto:  # minimum rectangle
+            dw, dh = np.mod(dw, stride), np.mod(dh, stride)  # wh padding
+            
+        elif scale_fill:  # stretch
+            dw, dh = 0, 0
+            new_unpad = (new_shape[1], new_shape[0])
+            ratio = new_shape[1] / shape[1], new_shape[0] / shape[0]  # width, height ratios
+            
+        dw /= 2  # divide padding into 2 sides
+        dh /= 2
+        
+        if shape[::-1] != new_unpad:  # resize
+            image = cv2.resize(image, new_unpad, interpolation=cv2.INTER_LINEAR)
+            
+        top, bottom = int(round(dh - 0.1)), int(round(dh + 0.1))
+        left, right = int(round(dw - 0.1)), int(round(dw + 0.1))
+        
+        image = cv2.copyMakeBorder(image, top, bottom, left, right, cv2.BORDER_CONSTANT, value=color)
+        
+        return image, ratio, (dw, dh)
     
     def pad(self, image, pad_size_divisor=32, pad_value=114):
         """
@@ -420,11 +487,38 @@ class YoloImageProcessor(ImageProcessingMixin):
         pad_size_divisor=None,
         pad_value=None,
         do_convert_rgb=None,
+        letterbox=None,
+        auto=None,
+        stride=None,
         return_tensors=None,
+        data_format=None,
+        input_data_format=None,
         **kwargs
     ):
         """
         Preprocess an image or batch of images for YOLO models.
+        
+        Args:
+            images: Image or batch of images
+            do_resize: Whether to resize images
+            size: Target size
+            resample: Resampling method
+            do_normalize: Whether to normalize images
+            do_rescale: Whether to rescale images
+            rescale_factor: Rescaling factor
+            do_pad: Whether to pad images
+            pad_size_divisor: Padding size divisor
+            pad_value: Padding value
+            do_convert_rgb: Whether to convert to RGB
+            letterbox: Whether to use letterbox resizing
+            auto: Whether to use minimum rectangle for letterbox
+            stride: Stride for size divisibility
+            return_tensors: Return format ('pt' for PyTorch tensors)
+            data_format: Output data format ('channels_first' or 'channels_last')
+            input_data_format: Input data format ('channels_first' or 'channels_last')
+            
+        Returns:
+            Dict with preprocessed images and metadata
         """
         do_resize = do_resize if do_resize is not None else self.do_resize
         size = size if size is not None else self.size
@@ -436,101 +530,275 @@ class YoloImageProcessor(ImageProcessingMixin):
         pad_size_divisor = pad_size_divisor if pad_size_divisor is not None else self.pad_size_divisor
         pad_value = pad_value if pad_value is not None else self.pad_value
         do_convert_rgb = do_convert_rgb if do_convert_rgb is not None else self.do_convert_rgb
+        letterbox = letterbox if letterbox is not None else self.letterbox
+        auto = auto if auto is not None else self.auto
+        stride = stride if stride is not None else self.stride
         
+        if data_format is None:
+            data_format = "channels_first" if return_tensors == "pt" else "channels_last"
+            
         # Handle single image
         if isinstance(images, (Image.Image, np.ndarray)):
             images = [images]
             
         # Process each image
         processed_images = []
+        ratios = []  # Store scale ratios for each image
+        padding_info = []  # Store padding info for each image
+        
         for image in images:
             # Convert to RGB if needed
-            if do_convert_rgb and isinstance(image, Image.Image) and image.mode != "RGB":
-                image = image.convert("RGB")
-                
-            # Resize if needed
-            if do_resize:
-                image = self.resize(image, size, resample)
-                
-            # Convert to numpy array if it's a PIL Image
+            if do_convert_rgb:
+                if isinstance(image, Image.Image) and image.mode != "RGB":
+                    image = image.convert("RGB")
+                elif isinstance(image, np.ndarray) and image.shape[-1] == 4:  # RGBA
+                    image = image[..., :3]  # Remove alpha channel
+            
+            # Convert PIL Image to numpy array
             if isinstance(image, Image.Image):
                 image = np.array(image)
                 
-            # Pad if needed
-            if do_pad:
+            # Get original image size
+            orig_height, orig_width = image.shape[:2]
+            orig_size = (orig_height, orig_width)
+            
+            # Resize with letterbox if requested
+            if do_resize:
+                if letterbox:
+                    # Use letterbox resize
+                    if isinstance(size, dict):
+                        target_size = (size["height"], size["width"])
+                    elif isinstance(size, int):
+                        target_size = (size, size)
+                    else:
+                        target_size = size
+                        
+                    image, ratio, pad = self.letterbox_process(
+                        image, #np.array (1080, 810, 3)
+                        new_shape=target_size, #(640, 640)
+                        color=(pad_value, pad_value, pad_value),
+                        auto=auto, 
+                        stride=stride
+                    )
+                    ratios.append(ratio)
+                    padding_info.append(pad)
+                else:
+                    # Standard resize
+                    if isinstance(size, dict):
+                        target_size = (size["height"], size["width"])
+                    elif isinstance(size, int):
+                        target_size = (size, size)
+                    else:
+                        target_size = size
+                        
+                    # Calculate ratio for later use
+                    ratio = (target_size[1] / orig_width, target_size[0] / orig_height)
+                    ratios.append(ratio)
+                    padding_info.append((0, 0))  # No padding in standard resize
+                    
+                    # Resize using cv2
+                    image = cv2.resize(
+                        image, 
+                        (target_size[1], target_size[0]),  # cv2 uses (width, height)
+                        interpolation=cv2.INTER_LINEAR
+                    )
+            else:
+                # No resize, just record original ratio
+                ratios.append((1.0, 1.0))
+                padding_info.append((0, 0))
+                
+            # Pad if needed and not using letterbox (letterbox already includes padding)
+            if do_pad and not (do_resize and letterbox):
                 image = self.pad(image, pad_size_divisor, pad_value)
                 
-            # Rescale if needed
+            # Rescale pixel values if needed
             if do_rescale:
                 image = image * rescale_factor
                 
-            # Normalize if needed
+            # Normalize if needed (YOLO models typically don't need normalization beyond rescaling)
             if do_normalize:
-                # YOLO models typically don't need normalization beyond rescaling
                 pass
+                
+            # Ensure image is float32 for PyTorch
+            if return_tensors == "pt":
+                image = image.astype(np.float32)
                 
             processed_images.append(image)
             
         # Convert to tensors if requested
         if return_tensors == "pt":
-            processed_images = [torch.tensor(img).permute(2, 0, 1).float() for img in processed_images]
+            # Convert to PyTorch tensors with correct data format
+            if data_format == "channels_first":
+                processed_images = [torch.tensor(img).permute(2, 0, 1) for img in processed_images]
+            else:
+                processed_images = [torch.tensor(img) for img in processed_images]
+                
             processed_images = torch.stack(processed_images)
             
-        return {"pixel_values": processed_images}
+        # Prepare return dictionary with metadata
+        result = {
+            "pixel_values": processed_images,
+            "original_sizes": [],
+            "reshaped_input_sizes": [],
+            "scale_factors": ratios,
+            "padding_info": padding_info
+        }
+        
+        # Ensure we always have original and reshaped sizes regardless of image format
+        for i, image in enumerate(images):
+            # Get original size
+            if isinstance(image, np.ndarray):
+                result["original_sizes"].append(image.shape[:2])
+            elif isinstance(image, Image.Image):
+                result["original_sizes"].append((image.height, image.width))
+            else:
+                # Try to get size from tensor
+                try:
+                    if image.ndim == 3:  # Single image tensor
+                        result["original_sizes"].append((image.shape[0], image.shape[1]))
+                    elif image.ndim == 4:  # Batch of image tensors
+                        result["original_sizes"].append((image.shape[2], image.shape[3]))
+                except:
+                    # Fallback to None if we can't determine size
+                    result["original_sizes"].append(None)
+        
+        # Get reshaped sizes
+        if isinstance(processed_images, list):
+            for img in processed_images:
+                if isinstance(img, np.ndarray):
+                    result["reshaped_input_sizes"].append(img.shape[:2])
+                elif isinstance(img, torch.Tensor):
+                    if img.ndim == 3:  # CHW format
+                        result["reshaped_input_sizes"].append((img.shape[1], img.shape[2]))
+                    elif img.ndim == 4:  # BCHW format
+                        result["reshaped_input_sizes"].append((img.shape[2], img.shape[3]))
+                else:
+                    result["reshaped_input_sizes"].append(None)
+        elif isinstance(processed_images, torch.Tensor):
+            # Handle batch tensor case
+            for i in range(processed_images.shape[0]):
+                if processed_images.ndim == 4:  # BCHW format
+                    result["reshaped_input_sizes"].append((processed_images.shape[2], processed_images.shape[3]))
+                else:
+                    result["reshaped_input_sizes"].append(None)
+        
+        return result
     
     def post_process_object_detection(
         self,
         outputs,
         threshold=0.5,
         target_sizes=None,
+        nms_threshold=0.45,
+        max_detections=300,
+        scale_factors=None,  # Add parameter to accept scale factors
+        padding_info=None    # Add parameter to accept padding info
     ):
         """
         Post-process the raw outputs of the model for object detection.
-        """
-        # Get predictions
-        if isinstance(outputs, dict):
-            logits = outputs.get("logits", outputs.get("pred_logits"))
-            boxes = outputs.get("pred_boxes")
-        else:
-            logits, boxes = outputs
-            
-        # Convert to list of batches
-        results = []
+        Focuses on rescaling boxes from letterboxed images to original dimensions.
         
-        batch_size = logits.shape[0]
-        for i in range(batch_size):
-            # Get scores and labels
-            scores = torch.sigmoid(logits[i])
-            labels = torch.arange(scores.shape[1]).unsqueeze(0).expand_as(scores)
+        Args:
+            outputs: Raw model outputs or already processed detections
+            threshold: Score threshold for detections (passed to model's postprocessing if needed)
+            target_sizes: Original image sizes for rescaling boxes
+            nms_threshold: IoU threshold for NMS (passed to model's postprocessing if needed)
+            max_detections: Maximum number of detections to return
+            scale_factors: Scale factors from preprocessing (ratios)
+            padding_info: Padding information from preprocessing (padding)
             
-            # Apply threshold
-            mask = scores > threshold
-            scores = scores[mask]
-            labels = labels[mask]
-            boxes_i = boxes[i][mask.any(dim=1)]
+        Returns:
+            List of dictionaries with processed detection results
+        """
+        # Check if outputs is already in the processed format
+        if isinstance(outputs, list) and all(isinstance(item, dict) and "boxes" in item for item in outputs):
+            # Outputs are already processed, just need to rescale boxes if target_sizes provided
+            results = []
             
-            # Rescale boxes if target sizes provided
-            if target_sizes is not None:
-                orig_h, orig_w = target_sizes[i]
-                scale_x = orig_w / self.size["width"]
-                scale_y = orig_h / self.size["height"]
+            for i, output in enumerate(outputs):
+                # Create a copy of the output to avoid modifying the original
+                result = {
+                    "scores": output["scores"],
+                    "labels": output["labels"],
+                    "boxes": output["boxes"].clone() if isinstance(output["boxes"], torch.Tensor) else output["boxes"].copy()
+                }
                 
-                boxes_i[:, [0, 2]] *= scale_x
-                boxes_i[:, [1, 3]] *= scale_y
+                # Apply rescaling if target sizes are provided
+                if target_sizes is not None and i < len(target_sizes):
+                    # Get original dimensions
+                    orig_h, orig_w = target_sizes[i]
+                    
+                    # Get scale factors and padding info if available
+                    # Use the passed parameters instead of trying to access instance attributes
+                    sf = (1.0, 1.0)
+                    pad = (0, 0)
+                    
+                    if scale_factors is not None and i < len(scale_factors):
+                        sf = scale_factors[i]
+                    
+                    if padding_info is not None and i < len(padding_info):
+                        pad = padding_info[i]
+                    
+                    # Rescale boxes to original image dimensions
+                    if isinstance(result["boxes"], torch.Tensor):
+                        # For letterboxed images, we need to:
+                        # 1. Remove padding
+                        # 2. Scale by the inverse of the resize ratio
+                        boxes = result["boxes"]
+                        
+                        # Remove padding (dw, dh)
+                        dw, dh = pad
+                        if dw > 0 or dh > 0:
+                            boxes[:, 0] -= dw  # x1
+                            boxes[:, 1] -= dh  # y1
+                            boxes[:, 2] -= dw  # x2
+                            boxes[:, 3] -= dh  # y2
+                        
+                        # Scale by inverse of resize ratio
+                        scale_x, scale_y = sf
+                        if scale_x != 1.0 or scale_y != 1.0:
+                            boxes[:, 0] /= scale_x  # x1
+                            boxes[:, 1] /= scale_y  # y1
+                            boxes[:, 2] /= scale_x  # x2
+                            boxes[:, 3] /= scale_y  # y2
+                        
+                        # Clip boxes to image boundaries
+                        boxes[:, 0].clamp_(min=0, max=orig_w)
+                        boxes[:, 1].clamp_(min=0, max=orig_h)
+                        boxes[:, 2].clamp_(min=0, max=orig_w)
+                        boxes[:, 3].clamp_(min=0, max=orig_h)
+                        
+                        result["boxes"] = boxes
                 
-                # Ensure boxes are within image boundaries
-                boxes_i[:, 0].clamp_(min=0, max=orig_w)
-                boxes_i[:, 1].clamp_(min=0, max=orig_h)
-                boxes_i[:, 2].clamp_(min=0, max=orig_w)
-                boxes_i[:, 3].clamp_(min=0, max=orig_h)
+                # Filter by threshold if needed
+                if threshold > 0:
+                    mask = result["scores"] > threshold
+                    result = {
+                        "scores": result["scores"][mask],
+                        "labels": result["labels"][mask],
+                        "boxes": result["boxes"][mask]
+                    }
+                
+                results.append(result)
             
-            results.append({
-                "scores": scores,
-                "labels": labels,
-                "boxes": boxes_i
-            })
+            return results
             
-        return results
+    def batch_decode(self, outputs, target_sizes=None):
+        """
+        Compatibility method for HuggingFace's AutoProcessor interface.
+        Equivalent to post_process_object_detection.
+        
+        Args:
+            outputs: Model outputs
+            target_sizes: Original image sizes
+            
+        Returns:
+            List of dictionaries with detection results
+        """
+        return self.post_process_object_detection(
+            outputs=outputs,
+            target_sizes=target_sizes
+        )
     
 class YoloDetectionModel(nn.Module):
     """YOLOv8 detection model with HuggingFace-compatible interface."""
@@ -1294,23 +1562,6 @@ def visualize_raw_detections(raw_outputs, original_image, conf_threshold=0.25, o
     if isinstance(raw_outputs, list):
         # If it's already a list of detection results
         detection_results = raw_outputs
-    elif isinstance(raw_outputs, torch.Tensor):
-        # If it's a tensor, process it to get boxes, scores, and labels
-        # Assuming format [batch, 8400, 84] after transpose
-        predictions = raw_outputs.permute(0, 2, 1)  # [batch, 84, 8400]
-        
-        # Process each image in the batch (usually just one)
-        detection_results = []
-        for i in range(predictions.shape[0]):
-            # Process using the postprocess_detections logic
-            results = postprocess_detections(
-                predictions[i:i+1],  # Keep batch dimension
-                img_shapes=None,     # No rescaling
-                conf_thres=conf_threshold,
-                iou_thres=0.45,
-                max_det=300
-            )
-            detection_results.extend(results)
     else:
         print(f"Unsupported raw_outputs type: {type(raw_outputs)}")
         return img_vis
@@ -1368,7 +1619,7 @@ def visualize_raw_detections(raw_outputs, original_image, conf_threshold=0.25, o
 
 
 
-def test_localmodel(scale = 's', use_fp16=True, visualize=True, output_dir="output"):
+def test_localmodel_detrprocess(scale = 's', use_fp16=True, visualize=True, output_dir="output"):
     # Initialize model
     # Initialize model with the specified scale
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -1538,6 +1789,138 @@ def test_localmodel(scale = 's', use_fp16=True, visualize=True, output_dir="outp
         # Add visualization path to detections
         detections["visualization_path"] = output_path
 
+def test_localmodel(scale='s', use_fp16=True, visualize=True, output_dir="output"):
+    """
+    Test a local YOLOv8 model using YoloImageProcessor for preprocessing
+    and YoloDetectionModel for inference.
+    
+    Args:
+        scale (str): Model scale - 'n', 's', 'm', 'l', or 'x'
+        use_fp16 (bool): Whether to use FP16 precision for faster inference
+        visualize (bool): Whether to visualize and save detection results
+        output_dir (str): Directory to save output visualizations
+    
+    Returns:
+        dict: Detection results
+    """
+    # Create output directory if it doesn't exist
+    if visualize and output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+    
+    # Initialize model with the specified scale
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    # Create a proper config object first
+    config = YoloConfig(
+        scale=scale,
+        nc=80,
+        ch=3,
+        min_size=640,
+        max_size=640,
+        use_fp16=use_fp16
+    )
+    
+    # Initialize model with config
+    model = YoloDetectionModel(
+        cfg=config,
+        device=device
+    )
+    
+    # Load pre-trained weights
+    weights_path = f"../modelzoo/yolov8{scale}_statedicts.pt"
+    model.load_state_dict(torch.load(weights_path))
+    model = model.to(device)
+    model.eval()
+    
+    # Enable FP16 precision if requested
+    if use_fp16 and device.type == 'cuda':
+        model = model.half()
+        print(f"Using FP16 precision for faster inference on {device}")
+    
+    # Load image
+    image_path = "ModelDev/sampledata/bus.jpg"
+    img_orig = cv2.imread(image_path)
+    if img_orig is None:
+        raise FileNotFoundError(f"Image not found at {image_path}")
+    
+    # Convert BGR to RGB (YoloImageProcessor expects RGB)
+    img_rgb = cv2.cvtColor(img_orig, cv2.COLOR_BGR2RGB)
+    
+    # Create PIL image for processor
+    pil_image = Image.fromarray(img_rgb)
+    
+    # Store original image size for postprocessing
+    orig_size = (img_orig.shape[0], img_orig.shape[1])  # (height, width)
+    
+    # Initialize YoloImageProcessor with letterbox preprocessing
+    processor = YoloImageProcessor(
+        do_resize=True,
+        size=640,
+        do_normalize=False,  # YOLOv8 doesn't need normalization beyond rescaling
+        do_rescale=True,
+        rescale_factor=1/255.0,
+        do_pad=True,
+        pad_size_divisor=32,
+        pad_value=114,
+        do_convert_rgb=True,
+        letterbox=True,  # Use letterbox resizing
+        auto=False,
+        stride=32
+    )
+    
+    # Preprocess image using YoloImageProcessor
+    inputs = processor.preprocess(
+        images=pil_image, 
+        return_tensors="pt"
+    )
+    # Get scale factors and padding info from preprocessing
+    scale_factors = inputs["scale_factors"]
+    padding_info = inputs["padding_info"]
+    
+    # Move inputs to the same device as model
+        # Move only tensor inputs to the same device as model
+    inputs = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in inputs.items()}
+    
+    # Convert inputs to half precision if model is in half precision
+    if use_fp16 and device.type == 'cuda':
+        inputs = {k: v.half() if isinstance(v, torch.Tensor) else v for k, v in inputs.items()}
+    
+    # Perform inference
+    with torch.no_grad():
+        # Get raw outputs without postprocessing
+        raw_outputs = model(
+            pixel_values=inputs["pixel_values"], 
+            postprocess=False #only NMS
+        )#list of dicts
+        #outputs = model(**inputs)
+        
+        # Post-process with scale factors and padding info
+        processed_outputs = processor.post_process_object_detection(
+            outputs=raw_outputs,
+            target_sizes=inputs["original_sizes"],
+            scale_factors=scale_factors,
+            padding_info=padding_info
+        )
+    
+    # Visualize detections if requested
+    if visualize:
+        # # Visualize raw detections
+        vis_img = visualize_raw_detections(
+            processed_outputs, 
+            img_orig, #inputs["pixel_values"], #
+            conf_threshold=0.25,
+            output_path="output/raw_detections.jpg"
+        )
+        
+        
+    # Return detection results
+    return {
+        "detections": processed_outputs,
+        "original_size": orig_size,
+        "model_scale": scale,
+        "visualization_path": output_path if visualize else None
+    }
+    
 def testviaHF():
     import cv2
     import torch
