@@ -38,6 +38,8 @@ twoargs_blocks = [
     nn.ConvTranspose2d, DWConvTranspose2d, C3x, RepC3
 ]#Classify, 
 
+MODEL_TYPE = "yolov8" #"detr"
+
 coco_names = {
     0: 'person', 1: 'bicycle', 2: 'car', 3: 'motorcycle', 4: 'airplane',
     5: 'bus', 6: 'train', 7: 'truck', 8: 'boat', 9: 'traffic light',
@@ -270,7 +272,7 @@ def parse_model(d, ch, verbose=True):
 from transformers import PretrainedConfig
 class YoloConfig(PretrainedConfig):
     """Configuration class for YOLOv8 models."""
-    model_type = "yolov8"
+    model_type = MODEL_TYPE
     
     def __init__(
         self,
@@ -308,28 +310,40 @@ def register_yolo_architecture():
     """
     Register the YOLOv8 model architecture with the Hugging Face transformers library
     for full integration with the transformers ecosystem.
+    
+    This function registers:
+    1. The YoloConfig configuration class
+    2. The YoloDetectionModel model class
+    3. The YoloImageProcessor processor class with letterbox support
     """
     from transformers import AutoConfig, AutoModel, AutoModelForObjectDetection
     from transformers.models.auto.configuration_auto import CONFIG_MAPPING
     from transformers.models.auto.modeling_auto import MODEL_MAPPING, MODEL_FOR_OBJECT_DETECTION_MAPPING
-    from transformers.models.auto.processing_auto import PROCESSOR_MAPPING, AutoProcessor
-    
-    # Import the image processor
-    #from DeepDataMiningLearning.detection.image_processor import YoloImageProcessor
-    # Import DETR's image processor
-    from transformers import DetrImageProcessor #use DetrImageProcessor not YOLO's
     
     # Register the config
-    CONFIG_MAPPING.register("yolov8", YoloConfig)
+    CONFIG_MAPPING.register(MODEL_TYPE, YoloConfig)
     
     # Register the model architecture
     MODEL_MAPPING.register(YoloConfig, YoloDetectionModel)
     MODEL_FOR_OBJECT_DETECTION_MAPPING.register(YoloConfig, YoloDetectionModel)
     
-    # Register the image processor
-    PROCESSOR_MAPPING.register(YoloConfig, YoloImageProcessor)
+    # Try to register with AutoModelForObjectDetection
+    try:
+        AutoModelForObjectDetection._model_mapping[YoloConfig] = YoloDetectionModel
+        print("Registered YoloDetectionModel with AutoModelForObjectDetection")
+    except (AttributeError, ImportError) as e:
+        print(f"Could not register with AutoModelForObjectDetection: {e}")
     
-    print("YOLOv8 architecture registered successfully with Hugging Face transformers")
+    # Try different methods to register the image processor
+    try:
+        # Method 1: Try to use PROCESSOR_MAPPING
+        from transformers.models.auto.processing_auto import PROCESSOR_MAPPING
+        PROCESSOR_MAPPING.register(YoloConfig, YoloImageProcessor)
+        print("Registered YoloImageProcessor with PROCESSOR_MAPPING")
+    except (ImportError, AttributeError) as e:
+        print(f"Could not register with PROCESSOR_MAPPING: {e}")
+    
+    print("YOLOv8 architecture registration completed")
     
 from transformers import ImageProcessingMixin
 import numpy as np
@@ -473,6 +487,21 @@ class YoloImageProcessor(ImageProcessingMixin):
         padded_image[:height, :width] = image
         
         return padded_image
+    
+    # Add the __call__ method to make the processor callable
+    def __call__(self, images, return_tensors=None, **kwargs):
+        """
+        Main method to prepare images for the model.
+        
+        Args:
+            images: The images to preprocess
+            return_tensors: The type of tensors to return (e.g., "pt" for PyTorch)
+            **kwargs: Additional arguments to pass to the preprocess method
+            
+        Returns:
+            Preprocessed images and metadata
+        """
+        return self.preprocess(images=images, return_tensors=return_tensors, **kwargs)
     
     def preprocess(
         self,
@@ -824,10 +853,10 @@ class YoloDetectionModel(nn.Module):
         self.yaml = get_yolo_config(scale, nc, ch)
         self.yaml['scale'] = scale
         #self.modelname = extract_filename(yaml_path)
-        self.modelname = "yolov8"
+        self.modelname = MODEL_TYPE
         self.scale = scale
         self.config = {
-            "model_type": "yolov8",
+            "model_type": MODEL_TYPE,
             "scale": scale,
             "num_classes": nc or self.yaml.get('nc', 80),
             "image_size": 640,
@@ -844,8 +873,23 @@ class YoloDetectionModel(nn.Module):
         
         # Parse model and get component indices based on scale
         self.model, self.save = parse_model(deepcopy(self.yaml), ch=ch, verbose=False)
-        self.names = {i: f'{i}' for i in range(self.yaml['nc'])}
+        #self.names = {i: f'{i}' for i in range(self.yaml['nc'])}
+        # Set up class names using COCO names
+        self.names = coco_names if nc == 80 else {i: f'class_{i}' for i in range(self.yaml['nc'])}
+        
         self.inplace = self.yaml.get('inplace', True)
+        
+        # Create config object with proper id2label and label2id mappings
+        self.config = YoloConfig(
+            scale=scale,
+            nc=self.yaml['nc'],
+            ch=ch,
+            min_size=min_size,
+            max_size=max_size,
+            use_fp16=use_fp16,
+            id2label={str(k): v for k, v in self.names.items()},
+            label2id={v: str(k) for k, v in self.names.items()}
+        )
 
         # Get component indices based on scale
         self.backbone_end, self.neck_end = self._get_component_indices(scale)
@@ -1382,7 +1426,7 @@ def upload_to_huggingface2(model, repo_id, token=None, commit_message="Upload mo
             # Create a config object if the model doesn't have one
             from transformers import PretrainedConfig
             config_dict = {
-                "model_type": "detr",  # Use DETR model type instead of custom yolov8
+                "model_type": MODEL_TYPE,  # Use our custom model type
                 "architectures": ["YoloDetectionModel"],
                 "scale": model.scale,
                 "num_classes": model.yaml.get('nc', 80),
@@ -1401,8 +1445,8 @@ def upload_to_huggingface2(model, repo_id, token=None, commit_message="Upload mo
         
         # Add image processor config
         processor_config = {
-            "image_processor_type": "DetrImageProcessor",  # Use DETR's image processor "YoloImageProcessor",
-            "do_normalize": True,
+            "image_processor_type": "YoloImageProcessor",  # Use our custom processor "image_processor_type": "DetrImageProcessor",  # Use DETR's image processor "YoloImageProcessor",
+            "do_normalize": False,  # YOLOv8 doesn't need normalization beyond rescaling
             "do_resize": True,
             "do_rescale": True,
             "do_pad": True,
@@ -1414,7 +1458,10 @@ def upload_to_huggingface2(model, repo_id, token=None, commit_message="Upload mo
             "rescale_factor": 0.00392156862745098,  # 1/255
             "do_convert_rgb": True,
             "pad_size_divisor": 32,
-            "pad_value": 114
+            "pad_value": 114,
+            "letterbox": True,  # Enable letterbox resizing
+            "auto": False,
+            "stride": 32
         }
         
         # Save the image processor config
@@ -1921,45 +1968,112 @@ def test_localmodel(scale='s', use_fp16=True, visualize=True, output_dir="output
         "visualization_path": output_path if visualize else None
     }
     
-def testviaHF():
+def testviaHF(repo_id):
     import cv2
     import torch
     import numpy as np
     from PIL import Image
+    from transformers import AutoImageProcessor, AutoModelForObjectDetection
 
-    # Load the model
-    model = AutoModelForObjectDetection.from_pretrained("{repo_id}")
+    register_yolo_architecture()
+    
+    # Load model and processor
+    #processor = AutoImageProcessor.from_pretrained(repo_id)
+    processor = YoloImageProcessor(
+        do_resize=True,
+        size=640,
+        do_normalize=False,
+        do_rescale=True,
+        rescale_factor=1/255.0,
+        do_pad=True,
+        pad_size_divisor=32,
+        pad_value=114,
+        do_convert_rgb=True,
+        letterbox=True,
+        auto=False,
+        stride=32
+    )
+    model = AutoModelForObjectDetection.from_pretrained(repo_id)
 
     # Load and preprocess an image
-    image_path = "path/to/your/image.jpg"
-    image = cv2.imread(image_path)
-    image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-    pil_image = Image.fromarray(image_rgb)
+    # image_path = "path/to/your/image.jpg"
+    # image = cv2.imread(image_path)
+    # image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    # pil_image = Image.fromarray(image_rgb)
+    # Load and process image
+    image = Image.open("ModelDev/sampledata/bus.jpg")
+    inputs = processor(images=image, return_tensors="pt")
 
-    # Process image and perform inference
-    processor = AutoImageProcessor.from_pretrained("{repo_id}")
-    inputs = processor(images=pil_image, return_tensors="pt")
+    # Get scale factors and padding info from preprocessing
+    scale_factors = inputs["scale_factors"]
+    padding_info = inputs["padding_info"]
+
+    # Run inference
     with torch.no_grad():
         outputs = model(**inputs)
 
-    # Process the outputs
+    # Post-process with scale factors and padding info for accurate box coordinates
     results = processor.post_process_object_detection(
-        outputs, threshold=0.5, target_sizes=[(image.shape[0], image.shape[1])]
-    )[0]
+        outputs=outputs,
+        threshold=0.25,
+        target_sizes=inputs["original_sizes"],
+        scale_factors=scale_factors,
+        padding_info=padding_info
+    )
+    
+    # Print results
+    for i, (boxes, scores, labels) in enumerate(zip(
+        results[0]["boxes"], results[0]["scores"], results[0]["labels"]
+    )):
+        # Safely get the label name, handling both string and integer keys
+        label_id = labels.item()
+        if hasattr(model, 'config') and hasattr(model.config, 'id2label'):
+            # Try to get the label from the model's config
+            if str(label_id) in model.config.id2label:
+                # If the key is stored as a string
+                label_name = model.config.id2label[str(label_id)]
+            elif label_id in model.config.id2label:
+                # If the key is stored as an integer
+                label_name = model.config.id2label[label_id]
+            else:
+                # Fallback to COCO class names or just use the ID
+                label_name = coco_names.get(label_id, f"class_{label_id}")
+        else:
+            # Fallback to COCO class names or just use the ID
+            label_name = coco_names.get(label_id, f"class_{label_id}")
+            
+        print(
+            f"Detected {label_name} with confidence "
+            f"{round(scores.item(), 3)} at location {boxes.tolist()}"
+        )
 
     # Draw bounding boxes on the image
-    for score, label, box in zip(results["scores"], results["labels"], results["boxes"]):
+    image_np = np.array(image)
+    for score, label, box in zip(results[0]["scores"], results[0]["labels"], results[0]["boxes"]):
         box = [int(i) for i in box.tolist()]
-        cv2.rectangle(image, (box[0], box[1]), (box[2], box[3]), (0, 255, 0), 2)
-        cv2.putText(image, 
-                    f"{{model.config.id2label[label.item()]}}: {{round(score.item(), 2)}}", 
+        
+        # Safely get the label name, same as above
+        label_id = label.item()
+        if hasattr(model, 'config') and hasattr(model.config, 'id2label'):
+            if str(label_id) in model.config.id2label:
+                label_name = model.config.id2label[str(label_id)]
+            elif label_id in model.config.id2label:
+                label_name = model.config.id2label[label_id]
+            else:
+                label_name = coco_names.get(label_id, f"class_{label_id}")
+        else:
+            label_name = coco_names.get(label_id, f"class_{label_id}")
+            
+        cv2.rectangle(image_np, (box[0], box[1]), (box[2], box[3]), (0, 255, 0), 2)
+        cv2.putText(image_np, 
+                    f"{label_name}: {round(score.item(), 2)}", 
                     (box[0], box[1] - 10), 
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
 
     # Save or display the result
-    cv2.imwrite("result.jpg", image)
-    cv2.imshow("Result", image)
-    cv2.waitKey(0)
+    cv2.imwrite("output/result.jpg", image_np)
+    # cv2.imshow("Result", image_np)
+    # cv2.waitKey(0)
 
 def test_upload_model():
     """
@@ -2045,7 +2159,7 @@ def upload_onetype_model(scale='s'):
     model.eval()
     
     # Upload to HuggingFace with scale in the repo name
-    repo_id = f"lkk688/yolov8{scale}-model"
+    repo_id = f"lkk688/{MODEL_TYPE}{scale}-model"
 
     # Example images for the model card (optional)
     example_images = [
@@ -2087,36 +2201,17 @@ def upload_onetype_model(scale='s'):
         print(f"Error uploading YOLOv8{scale} model: {e}")
         raise
 
-from transformers import AutoModelForObjectDetection, AutoConfig
-def test_model_loading(repo_id):
-    """Test loading a YOLOv8 model from Hugging Face Hub."""
-    print(f"Testing model loading from {repo_id}...")
-    
-    # Register the model first
-    register_yolo_architecture()
-    
-    # Try to load the model
-    try:
-        model = AutoModelForObjectDetection.from_pretrained(repo_id)
-        print(f"Successfully loaded model from {repo_id}")
-        print(f"Model type: {type(model).__name__}")
-        print(f"Model scale: {model.scale}")
-        print(f"Number of classes: {model.config.num_classes}")
-        return True
-    except Exception as e:
-        print(f"Error loading model: {e}")
-        return False
     
 if __name__ == "__main__":
     import argparse
     
     parser = argparse.ArgumentParser(description="FasterRCNN Model Operations")
-    parser.add_argument("--action", type=str, default="test", 
+    parser.add_argument("--action", type=str, default="load", 
                         choices=["test", "upload", "load", "pipeline"],
                         help="Action to perform: upload to HF, run ONNX inference, or run HF pipeline")
     args = parser.parse_args()
     if args.action == "test":
-        test_localmodel()
+        test_localmodel() #works
     elif args.action == "upload":
         #test_upload_model()
         # Or upload all scales in sequence
@@ -2128,7 +2223,7 @@ if __name__ == "__main__":
                 print(f"Error uploading YOLOv8{scale}: {e}")
     elif args.action == "load":
         repo_id = "lkk688/yolov8s-model"
-        test_model_loading(repo_id)
+        testviaHF(repo_id)
 
 #
 # DETR's image processor ( DetrImageProcessor ) doesn't natively support letterboxing in the same way as YOLOv8. YOLOv8's letterbox preprocessing maintains the aspect ratio of the image by padding to a square, while DETR typically resizes images without preserving aspect ratio.
