@@ -1230,69 +1230,6 @@ class YoloDetectionModel(nn.Module):
         y[..., 3] = x[..., 1] + x[..., 3] / 2  # y2 = y + h/2
         return y
 
-    def convert_to_detr_format(self, yolo_results):
-        """
-        Convert YOLO detection results to DETR format for compatibility with DETR processors.
-        
-        Args:
-            yolo_results (list): List of dictionaries with YOLO detection results
-            
-        Returns:
-            dict: DETR-style output dictionary with 'pred_boxes' and 'logits' keys
-        """
-        batch_size = len(yolo_results) #1
-        
-        # Initialize DETR-style output dictionary
-        detr_outputs = {
-            "pred_boxes": [],
-            "pred_logits": []
-        }
-        
-        # Process each image's results
-        for i in range(batch_size):
-            result = yolo_results[i]
-            boxes = result["boxes"] #torch.Size([4, 4])
-            scores = result["scores"] #torch.Size([4])
-            labels = result["labels"]
-            
-            # Number of classes in the model
-            num_classes = self.yaml.get('nc', 80)
-            
-            # Normalize scores if they're unusually large
-            if scores.max() > 1.0:
-                scores = torch.sigmoid(scores)  # Apply sigmoid if scores are logits
-            
-            # Ensure labels are within valid range
-            if labels.max() >= num_classes:
-                labels = labels % num_classes  # Use modulo to bring into valid range
-            
-            # Create logits tensor (convert scores to logits)
-            # DETR expects logits before sigmoid, so we apply inverse sigmoid
-            # Note: This is an approximation since we don't have the original logits
-            eps = 1e-6
-            scores_clamped = torch.clamp(scores, eps, 1 - eps)
-            logits = torch.zeros((boxes.shape[0], num_classes), device=boxes.device)
-            
-            # Set logits for detected classes
-            for j in range(boxes.shape[0]):
-                class_id = labels[j].item()
-                if 0 <= class_id < num_classes:
-                    # Apply inverse sigmoid: log(p/(1-p))
-                    logits[j, class_id] = torch.log(scores_clamped[j] / (1 - scores_clamped[j]))
-            
-            detr_outputs["pred_boxes"].append(boxes)
-            detr_outputs["pred_logits"].append(logits)
-        
-        # Stack tensors if batch size > 1
-        if batch_size > 1:
-            detr_outputs["pred_boxes"] = torch.stack(detr_outputs["pred_boxes"])
-            detr_outputs["pred_logits"] = torch.stack(detr_outputs["pred_logits"])
-        else:
-            detr_outputs["pred_boxes"] = detr_outputs["pred_boxes"][0].unsqueeze(0) #[1, 1, 4]
-            detr_outputs["pred_logits"] = detr_outputs["pred_logits"][0].unsqueeze(0) #[1, 1, 80]
-        
-        return detr_outputs
-
     
     def loss(self, batch, preds=None):
         """

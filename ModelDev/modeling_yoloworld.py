@@ -19,9 +19,9 @@ import cv2
 from torch.utils.data import Dataset, DataLoader
 from PIL import Image
 
-class YOLOWorld:
+class MultiWorld:
     """
-    YOLOWorld class that implements object detection model training, evaluation, and inference
+    MultiWorld class that implements object detection model training, evaluation, and inference
     based on the Hugging Face framework. Supports multiple model architectures including:
     - YOLOv8
     - DETR
@@ -32,7 +32,7 @@ class YOLOWorld:
     """
     def __init__(self, model=None, config=None, model_type="yolov8", model_name=None, scale='s', device=None):
         """
-        Initialize YOLOWorld with a model or create a new one.
+        Initialize MultiWorld with a model or create a new one.
         
         Args:
             model: Existing detection model or None to create a new one
@@ -53,7 +53,7 @@ class YOLOWorld:
                 self.model_type = self._detect_model_type(self.model, model_name)
             else:
                 # Create a new model based on model_type
-                self.model = self._create_model(model_type, config, scale)
+                self.model = self._create_model(model_type, config, scale, model_name)
         else:
             self.model = model
             # Try to detect model type if not explicitly provided
@@ -76,48 +76,25 @@ class YOLOWorld:
         
         # COCO class names
         self.class_names = coco_names
+        
+        # Update model config with COCO class names if needed
+        self._update_model_config_with_class_names()
     
-    def _detect_model_type(self, model, model_name=None):
+    def _update_model_config_with_class_names(self):
         """
-        Detect the type of model based on its class name or model name.
-        
-        Args:
-            model: Model instance
-            model_name: Optional model name from Hugging Face Hub
-            
-        Returns:
-            Detected model type as string
+        Update the model's configuration with COCO class names if needed.
         """
-        if model_name:
-            model_name = model_name.lower()
-            if 'detr-' in model_name and 'rt' not in model_name:
-                return 'detr'
-            elif 'rt-detr' in model_name:
-                return 'rt-detr'
-            elif 'rt-detrv2' in model_name:
-                return 'rt-detrv2'
-            elif 'vitdet' in model_name or 'vit-det' in model_name:
-                return 'vitdet'
-            elif 'yolo' in model_name:
-                return 'yolov8'
-        
-        # Check model class name
-        class_name = model.__class__.__name__.lower()
-        if 'yolo' in class_name:
-            return 'yolov8'
-        elif 'detr' in class_name:
-            if 'rt' in class_name:
-                if 'v2' in class_name:
-                    return 'rt-detrv2'
-                return 'rt-detr'
-            return 'detr'
-        elif 'vit' in class_name and ('det' in class_name or 'object' in class_name):
-            return 'vitdet'
-        
-        # Default to YOLO if can't determine
-        return 'yolov8'
+        if hasattr(self.model, 'config'):
+            # Check if id2label is missing or empty
+            if not hasattr(self.model.config, 'id2label') or not self.model.config.id2label:
+                self.model.config.id2label = {str(k): v for k, v in self.class_names.items()}
+                self.model.config.label2id = {v: str(k) for k, v in self.class_names.items()}
+            # Check if using numeric keys instead of string keys
+            elif all(isinstance(k, int) for k in self.model.config.id2label.keys()):
+                self.model.config.id2label = {str(k): v for k, v in self.model.config.id2label.items()}
+                self.model.config.label2id = {v: str(k) for k, v in self.model.config.id2label.items()}
     
-    def _create_model(self, model_type, config=None, scale='s'):
+    def _create_model(self, model_type, config=None, scale='s', model_name=None):
         """
         Create a new model based on the specified type.
         
@@ -125,6 +102,7 @@ class YOLOWorld:
             model_type: Type of model to create
             config: Optional config for the model
             scale: Scale for YOLO models
+            model_name: Optional model name for loading from HF Hub
             
         Returns:
             New model instance
@@ -140,52 +118,31 @@ class YOLOWorld:
                     max_size=640,
                     use_fp16=True if self.device.type == 'cuda' else False
                 )
-            return YoloDetectionModel(cfg=config, device=self.device)
-        
-        elif model_type == 'detr':
-            # Create DETR model
-            from transformers import DetrForObjectDetection
-            return DetrForObjectDetection.from_pretrained("facebook/detr-resnet-50")
-        
-        elif model_type == 'rt-detr':
-            # Create RT-DETR model
-            from transformers import RtDetrForObjectDetection
-            return RtDetrForObjectDetection.from_pretrained("mindee/rt-detr-resnet-50")
-        
-        elif model_type == 'rt-detrv2':
-            # Create RT-DETRv2 model if available
-            try:
+                
+            # Check if a specific model name is provided to load from HF Hub
+            if model_name and 'yolo' in model_name.lower():
+                # Register YOLO architecture with HF
+                from modeling_yolohfdetr import register_yolo_architecture
+                register_yolo_architecture()
+                
+                # Load model from Hugging Face Hub
                 from transformers import AutoModelForObjectDetection
-                return AutoModelForObjectDetection.from_pretrained("mindee/rt-detrv2-resnet-50")
-            except:
-                print("RT-DETRv2 not available, falling back to RT-DETR")
-                from transformers import RtDetrForObjectDetection
-                return RtDetrForObjectDetection.from_pretrained("mindee/rt-detr-resnet-50")
-        
-        elif model_type == 'vitdet':
-            # Create ViTDet model
-            try:
-                from transformers import AutoModelForObjectDetection
-                return AutoModelForObjectDetection.from_pretrained("facebook/vit-det-base")
-            except:
-                print("ViTDet not available, falling back to DETR")
-                from transformers import DetrForObjectDetection
-                return DetrForObjectDetection.from_pretrained("facebook/detr-resnet-50")
-        
-        else:
-            # Default to YOLO
-            print(f"Unknown model type '{model_type}', defaulting to YOLOv8")
-            if config is None:
-                config = YoloConfig(
-                    scale=scale,
-                    nc=80,
-                    ch=3,
-                    min_size=640,
-                    max_size=640,
-                    use_fp16=True if self.device.type == 'cuda' else False
-                )
+                try:
+                    print(f"Loading YOLO model from Hugging Face Hub: {model_name}")
+                    model = AutoModelForObjectDetection.from_pretrained(model_name)
+                    # Update model's config with COCO class names if needed
+                    if hasattr(model, 'config') and hasattr(model.config, 'id2label'):
+                        if not model.config.id2label or len(model.config.id2label) == 0:
+                            model.config.id2label = {str(k): v for k, v in coco_names.items()}
+                            model.config.label2id = {v: str(k) for k, v in coco_names.items()}
+                    return model
+                except Exception as e:
+                    print(f"Error loading YOLO model from HF Hub: {e}")
+                    print("Falling back to local YOLOv8 model creation")
+            
+            # Create local model if no HF model was loaded
             return YoloDetectionModel(cfg=config, device=self.device)
-    
+            
     def _load_from_hub(self, model_name):
         """
         Load a model from Hugging Face Hub.
@@ -197,8 +154,23 @@ class YOLOWorld:
             Loaded model
         """
         try:
+            # Check if this is a YOLO model
+            if 'yolo' in model_name.lower():
+                # Register YOLO architecture with HF
+                from modeling_yolohfdetr import register_yolo_architecture
+                register_yolo_architecture()
+                
             from transformers import AutoModelForObjectDetection
-            return AutoModelForObjectDetection.from_pretrained(model_name)
+            print(f"Loading model from Hugging Face Hub: {model_name}")
+            model = AutoModelForObjectDetection.from_pretrained(model_name)
+            
+            # Update model's config with COCO class names if needed
+            if hasattr(model, 'config') and hasattr(model.config, 'id2label'):
+                if not model.config.id2label or len(model.config.id2label) == 0:
+                    model.config.id2label = {str(k): v for k, v in coco_names.items()}
+                    model.config.label2id = {v: str(k) for k, v in coco_names.items()}
+            
+            return model
         except Exception as e:
             print(f"Error loading model from hub: {e}")
             print("Falling back to YOLOv8")
@@ -213,6 +185,61 @@ class YOLOWorld:
                 ),
                 device=self.device
             )
+    
+    def _detect_model_type(self, model, model_name=None):
+        """
+        Detect the type of model based on its architecture or name.
+        
+        Args:
+            model: Model to detect type for
+            model_name: Optional model name to help with detection
+            
+        Returns:
+            Detected model type as string
+        """
+        # First check model name if provided
+        if model_name:
+            model_name_lower = model_name.lower()
+            if 'yolo' in model_name_lower:
+                return 'yolov8'
+            elif 'detr-' in model_name_lower:
+                return 'detr'
+            elif 'rt-detrv2' in model_name_lower:
+                return 'rt-detrv2'
+            elif 'rt-detr' in model_name_lower:
+                return 'rt-detr'
+            elif 'vit-det' in model_name_lower:
+                return 'vitdet'
+        
+        # Check model architecture
+        model_class_name = model.__class__.__name__
+        if 'Yolo' in model_class_name:
+            return 'yolov8'
+        elif 'Detr' in model_class_name:
+            if hasattr(model, 'config') and hasattr(model.config, 'model_type'):
+                if 'rt-detr' in model.config.model_type.lower():
+                    return 'rt-detr'
+            return 'detr'
+        elif 'ViT' in model_class_name or 'Vit' in model_class_name:
+            return 'vitdet'
+        
+        # Check model config
+        if hasattr(model, 'config') and hasattr(model.config, 'model_type'):
+            model_type = model.config.model_type.lower()
+            if 'yolo' in model_type:
+                return 'yolov8'
+            elif 'rt-detrv2' in model_type:
+                return 'rt-detrv2'
+            elif 'rt-detr' in model_type:
+                return 'rt-detr'
+            elif 'detr' in model_type:
+                return 'detr'
+            elif 'vit' in model_type and 'det' in model_type:
+                return 'vitdet'
+        
+        # Default to YOLO if can't determine
+        print(f"Could not determine model type, defaulting to 'yolov8'")
+        return 'yolov8'
     
     def _create_default_config(self, model_type, scale='s'):
         """
@@ -262,13 +289,33 @@ class YOLOWorld:
         Returns:
             Image processor instance
         """
+        # Check if model has a processor attribute (from HF Hub)
+        if hasattr(self.model, 'processor') and self.model.processor is not None:
+            return self.model.processor
+            
+        # Check if model has a config with processor_class
+        if hasattr(self.model, 'config') and hasattr(self.model.config, 'processor_class'):
+            try:
+                from transformers import AutoImageProcessor
+                return AutoImageProcessor.from_pretrained(self.model.config.processor_class)
+            except Exception as e:
+                print(f"Failed to load processor from config: {e}")
+                
         if self.model_type == 'yolov8':
-            from transformers import DetrImageProcessor
-            return DetrImageProcessor(
+            from modeling_yolohf import YoloImageProcessor
+            return YoloImageProcessor(
                 do_resize=True,
-                size={"height": self.config.min_size, "width": self.config.max_size},
-                do_normalize=True,
-                do_rescale=True
+                size=640,
+                do_normalize=False,
+                do_rescale=True,
+                rescale_factor=1/255.0,
+                do_pad=True,
+                pad_size_divisor=32,
+                pad_value=114,
+                do_convert_rgb=True,
+                letterbox=True,
+                auto=False,
+                stride=32
             )
         elif self.model_type == 'detr':
             from transformers import DetrImageProcessor
@@ -349,11 +396,32 @@ class YOLOWorld:
         
         Args:
             weights_path: Path to weights file
+            
+        Returns:
+            True if successful, False otherwise
         """
         try:
             state_dict = torch.load(weights_path, map_location=self.device)
-            self.model.load_state_dict(state_dict)
+            
+            # Handle case where state_dict is inside a 'model' or 'state_dict' key
+            if 'model' in state_dict:
+                state_dict = state_dict['model']
+            elif 'state_dict' in state_dict:
+                state_dict = state_dict['state_dict']
+                
+            # Try to load state dict, handling potential key mismatches
+            try:
+                self.model.load_state_dict(state_dict, strict=True)
+            except RuntimeError as e:
+                print(f"Warning: Strict loading failed: {e}")
+                print("Attempting to load with strict=False...")
+                self.model.load_state_dict(state_dict, strict=False)
+                
             print(f"Loaded weights from {weights_path}")
+            
+            # Update processor after loading weights
+            self.processor = self._create_processor()
+            
             return True
         except Exception as e:
             print(f"Error loading weights: {e}")
@@ -365,13 +433,35 @@ class YOLOWorld:
         
         Args:
             repo_id: Repository ID on Hugging Face Hub
+            
+        Returns:
+            True if successful, False otherwise
         """
         try:
+            # Check if this is a YOLO model
+            if 'yolo' in repo_id.lower():
+                # Register YOLO architecture with HF
+                from modeling_yolohf import register_yolo_architecture
+                register_yolo_architecture()
+                
             from transformers import AutoModelForObjectDetection
+            print(f"Loading model from Hugging Face Hub: {repo_id}")
             self.model = AutoModelForObjectDetection.from_pretrained(repo_id)
             self.model = self.model.to(self.device)
+            
+            # Detect model type from the loaded model
             self.model_type = self._detect_model_type(self.model, repo_id)
+            
+            # Update model's config with COCO class names if needed
+            self._update_model_config_with_class_names()
+            
+            # Update config reference
+            if hasattr(self.model, 'config'):
+                self.config = self.model.config
+                
+            # Update processor
             self.processor = self._create_processor()
+            
             print(f"Loaded pretrained model from {repo_id}")
             return True
         except Exception as e:
@@ -2382,12 +2472,12 @@ class DetectionDataset(Dataset):
         
         return coco
                 
-def test_yoloworld():
+def test_multiworld():
     """
-    Test function for YOLOWorld class.
+    Test function for MultiWorld class.
     """
-    # Initialize YOLOWorld
-    yolo = YOLOWorld(scale='s')
+    # Initialize MultiWorld
+    yolo = MultiWorld(scale='s')
     
     # Load weights
     yolo.load_weights("../modelzoo/yolov8s_statedicts.pt")
@@ -2408,7 +2498,7 @@ def test_yoloworld():
         print(f"  {i+1}. {class_name}: {score.item():.4f}")
     
     # Display the image
-    cv2.imshow("YOLOWorld Detection", results["visualization"])
+    cv2.imshow("MultiWorld Detection", results["visualization"])
     cv2.waitKey(0)
     cv2.destroyAllWindows()
 
