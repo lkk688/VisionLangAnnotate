@@ -27,7 +27,7 @@ def test_huggingface_model(repo_id, image_path, output_dir=None, confidence_thre
     register_yolo_architecture()
     print(f"Downloading model from {repo_id}...")
     # Load model and processor from Hugging Face
-    processor = AutoImageProcessor.from_pretrained("facebook/detr-resnet-50")
+    processor = AutoImageProcessor.from_pretrained(repo_id)#("facebook/detr-resnet-50")
     model = AutoModelForObjectDetection.from_pretrained(repo_id)
     
     # Move model to GPU if available
