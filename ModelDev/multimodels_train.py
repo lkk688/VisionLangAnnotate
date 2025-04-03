@@ -338,20 +338,20 @@ def test_trainmultimodels():
     parser = argparse.ArgumentParser(description='Train MultiModels on mixed datasets')
     parser.add_argument('--model', type=str, default='yolov8', help='Model type (yolov8, detr, rt-detr, rt-detrv2, vitdet)')
     parser.add_argument('--weights', type=str, default="", help='Path to pretrained weights (optional)')
-    parser.add_argument('--hub_model', type=str, default="", help='HF Hub model name (e.g., "facebook/detr-resnet-50")')
-    parser.add_argument('--output_dir', type=str, default="./runs/train", help='Output directory for training results')
+    parser.add_argument('--hub_model', type=str, default="lkk688/yolov8s-model", help='HF Hub model name (e.g., "facebook/detr-resnet-50")')
+    parser.add_argument('--output_dir', type=str, default="output/train", help='Output directory for training results')
     
     # Dataset arguments
     parser.add_argument('--use_coco', action='store_true', default=False, help='Use COCO dataset for training')
     parser.add_argument('--coco_dir', type=str, default="/DATA10T/Datasets/COCO", help='COCO dataset directory')
     parser.add_argument('--coco_weight', type=float, default=1.0, help='Weight for COCO dataset in mixed training')
     
-    parser.add_argument('--use_kitti', action='store_true', default=False, help='Use KITTI dataset for training')
+    parser.add_argument('--use_kitti', action='store_true', default=True, help='Use KITTI dataset for training')
     parser.add_argument('--kitti_dir', type=str, default="/DATA10T/Datasets/Kitti", help='KITTI dataset directory')
     parser.add_argument('--kitti_weight', type=float, default=1.0, help='Weight for KITTI dataset in mixed training')
     
     # Training parameters
-    parser.add_argument('--epochs', type=int, default=50, help='Number of training epochs')
+    parser.add_argument('--epochs', type=int, default=20, help='Number of training epochs')
     parser.add_argument('--batch_size', type=int, default=16, help='Batch size')
     parser.add_argument('--img_size', type=int, default=640, help='Image size for training')
     parser.add_argument('--lr', type=float, default=0.01, help='Initial learning rate')
@@ -414,7 +414,7 @@ def test_trainmultimodels():
             data_dir=args.coco_dir,
             split='train',
             target_size=(args.img_size, args.img_size),
-            augment=True
+            augment=False
         )
         datasets.append(coco_dataset)
         dataset_weights.append(args.coco_weight)
@@ -427,8 +427,8 @@ def test_trainmultimodels():
             data_dir=args.kitti_dir,
             split='train',
             target_size=(args.img_size, args.img_size),
-            augment=True,
-            class_mapping=kitti_to_coco  # Apply class mapping
+            augment=False,
+            class_map=kitti_to_coco  # Apply class mapping
         )
         datasets.append(kitti_dataset)
         dataset_weights.append(args.kitti_weight)

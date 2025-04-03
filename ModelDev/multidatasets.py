@@ -332,6 +332,9 @@ class DetectionDataset(Dataset):
         Returns:
             Tuple of (augmented_image, augmented_target)
         """
+        # Skip augmentation if not enabled
+        if not self.augment:
+            return img, target
         # Make a copy of the target to avoid modifying the original
         target = {k: v.clone() if isinstance(v, torch.Tensor) else v.copy() if isinstance(v, np.ndarray) else v 
                  for k, v in target.items()}
@@ -351,25 +354,41 @@ class DetectionDataset(Dataset):
         else:
             boxes_np = boxes
             
-        # 1. Random horizontal flip (50% probability)
+        # Random horizontal flip
         if random.random() < 0.5:
             img = cv2.flip(img, 1)  # 1 for horizontal flip
             
-            # Flip boxes: x_new = width - x_old
-            if len(boxes_np) > 0:
-                boxes_np[:, [0, 2]] = width - boxes_np[:, [2, 0]]
+            # Flip bounding boxes
+            if 'boxes' in target:
+                width = img.shape[1]
+                boxes = target['boxes'].copy()
+                boxes[:, 0] = width - boxes[:, 0] - boxes[:, 2]  # Flip x coordinates
+                target['boxes'] = boxes
         
-        # 2. Random brightness and contrast adjustment (30% probability)
-        if random.random() < 0.3:
-            # Brightness adjustment
-            brightness_factor = random.uniform(0.8, 1.2)
-            img = cv2.convertScaleAbs(img, alpha=brightness_factor, beta=0)
-            
-            # Contrast adjustment
-            contrast_factor = random.uniform(0.8, 1.2)
-            mean_val = np.mean(img, axis=(0, 1))
-            img = cv2.convertScaleAbs(img, alpha=contrast_factor, beta=(1-contrast_factor)*mean_val)
-        
+        # Random brightness and contrast adjustment
+        if random.random() < 0.5:
+            # Ensure img is not None and has valid shape
+            if img is None or img.size == 0:
+                return img, target
+                
+            # Safer contrast adjustment
+            try:
+                # Get a random contrast factor between 0.5 and 1.5
+                contrast_factor = random.uniform(0.5, 1.5)
+                
+                # Calculate mean value for contrast adjustment
+                mean_val = np.mean(img)
+                
+                # Apply contrast adjustment with error handling
+                if mean_val > 0 and contrast_factor > 0:
+                    img = cv2.convertScaleAbs(img, alpha=contrast_factor, beta=(1-contrast_factor)*mean_val)
+                else:
+                    # Skip contrast adjustment if parameters are invalid
+                    pass
+            except Exception as e:
+                print(f"Warning: Skipping contrast adjustment due to error: {e}")
+                # Continue with original image
+                
         # 3. Random saturation and hue adjustment (20% probability)
         if random.random() < 0.2:
             # Convert to HSV

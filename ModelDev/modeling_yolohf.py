@@ -30,7 +30,10 @@ from DeepDataMiningLearning.detection.modules.block import (
 from DeepDataMiningLearning.detection.modules.head import IDetect, Classify, Pose, RTDETRDecoder, Segment, Detect
 #from DeepDataMiningLearning.detection.modules.utils import LOGGER
 from DeepDataMiningLearning.detection.modules.anchor import check_anchor_order
-
+from DeepDataMiningLearning.detection.modules.tal import TaskAlignedAssigner, dist2bbox, make_anchors, bbox2dist
+from DeepDataMiningLearning.detection.modules.metrics import bbox_iou
+from DeepDataMiningLearning.detection.modules.utils import xywh2xyxy
+from DeepDataMiningLearning.detection.modules.lossv8 import BboxLoss
 # Define blocks that take two arguments
 twoargs_blocks = [
     nn.Conv2d, Conv, ConvTranspose, GhostConv, RepConv, Bottleneck, GhostBottleneck, 
@@ -828,6 +831,180 @@ class YoloImageProcessor(ImageProcessingMixin):
             outputs=outputs,
             target_sizes=target_sizes
         )
+
+class YOLOv8DetectionLoss:
+    """Criterion class for computing training losses for YOLOv8 detection."""
+
+    def __init__(self, model):  # model must be de-paralleled
+        device = next(model.parameters()).device  # get model device
+        m = model.model[-1]  # Detect() module
+
+        # Binary cross entropy loss with no reduction
+        self.bce = nn.BCEWithLogitsLoss(reduction='none')
+        
+        # Hyperparameters
+        self.hypbox = 7.5  # box loss gain
+        self.hypcls = 0.5  # cls loss gain (scale with pixels)
+        self.hypdfl = 1.5  # dfl loss gain
+        
+        self.stride = m.stride  # model strides
+        self.nc = m.nc  # number of classes
+        self.no = m.no  # number of outputs per anchor
+        self.reg_max = m.reg_max  # maximum regression value
+        self.device = device
+
+        self.use_dfl = m.reg_max > 1  # Use Distribution Focal Loss
+
+        # Task-aligned assigner for assigning targets to predictions
+        self.assigner = TaskAlignedAssigner(topk=10, num_classes=self.nc, alpha=0.5, beta=6.0)
+        
+        # Bounding box loss
+        self.bbox_loss = BboxLoss(m.reg_max - 1, use_dfl=self.use_dfl).to(device)
+
+        # Project tensor for DFL calculations
+        self.proj = torch.arange(m.reg_max, dtype=torch.float, device=device)
+
+    def preprocess(self, targets, batch_size, scale_tensor):
+        """
+        Preprocesses the target counts and matches with the input batch size to output a tensor.
+        
+        Args:
+            targets (torch.Tensor): Targets tensor with [batch_idx, cls, x, y, w, h]
+            batch_size (int): Batch size
+            scale_tensor (torch.Tensor): Tensor to scale targets
+            
+        Returns:
+            torch.Tensor: Processed targets
+        """
+        if targets.shape[0] == 0:
+            out = torch.zeros(batch_size, 0, 5, device=self.device)
+        else:
+            i = targets[:, 0]  # image index (batch_idx)
+            _, counts = i.unique(return_counts=True)  # count objects per image
+            counts = counts.to(dtype=torch.int32)
+            out = torch.zeros(batch_size, counts.max(), 5, device=self.device)  # (batch_size, max_objects, 5)
+            
+            for j in range(batch_size):
+                matches = i == j
+                n = matches.sum()
+                if n:
+                    out[j, :n] = targets[matches, 1:]  # [class, x, y, w, h]
+            
+            # Scale targets by image dimensions
+            out[..., 1:5] = xywh2xyxy(out[..., 1:5].mul(scale_tensor))
+        
+        return out
+
+    def __call__(self, preds, batch):
+        """
+        Calculate and return loss for YOLOv8 detection.
+        
+        Args:
+            preds (tuple): Model predictions
+            batch (dict): Batch data with images and targets
+            
+        Returns:
+            tuple: (total_loss, loss_items_dict)
+        """
+        # Get predictions
+        feats = preds[1] if isinstance(preds, tuple) else preds
+        
+        # Get batch data
+        batch_size = len(batch['img'])
+        batch_idx = batch.get('batch_idx', torch.zeros(batch_size, device=self.device))
+        
+        # Process targets
+        targets = torch.cat((batch_idx.view(-1, 1), batch['cls'].view(-1, 1), batch['bboxes']), 1)
+        
+        # Get image size for scaling
+        imgsz = torch.tensor(batch['img'].shape[2:], device=self.device, dtype=torch.float)
+        scale_tensor = torch.tensor([1, 1, imgsz[0], imgsz[1], imgsz[0], imgsz[1]], device=self.device)
+        
+        # Preprocess targets
+        targets = self.preprocess(targets, batch_size, scale_tensor)
+        
+        # Build targets for loss computation
+        out = preds[0] if isinstance(preds, tuple) else preds
+        
+        # Prepare predictions
+        pred_distri, pred_scores = torch.cat([xi.view(batch_size, self.no, -1) for xi in out], 2).split(
+            (self.reg_max * 4, self.nc), 1)
+        
+        # Make grid
+        pred_scores = pred_scores.permute(0, 2, 1).contiguous()  # (batch_size, anchors, classes)
+        pred_distri = pred_distri.permute(0, 2, 1).contiguous()  # (batch_size, anchors, 4*reg_max)
+        
+        # Get feature dimensions
+        dtype = pred_scores.dtype
+        batch_size, num_anchors = pred_scores.shape[:2]
+        
+        # Create anchors
+        anchors, strides = make_anchors(feats, self.stride, 0.5)
+        
+        # Decode predictions
+        pred_bboxes = dist2bbox(pred_distri, self.proj, self.stride)
+        
+        # Target assignment
+        targets = targets.to(dtype)
+        mask_gt = targets.sum(dim=2, keepdim=True).gt_(0)  # (batch_size, max_objects, 1)
+        
+        # Process each image in batch
+        total_loss = torch.zeros(1, device=self.device)
+        loss_items = {"box_loss": 0.0, "cls_loss": 0.0, "dfl_loss": 0.0}
+        
+        # Number of anchors, targets
+        num_targets = (mask_gt > 0).sum().item()
+        
+        # Skip loss computation if no targets
+        if num_targets == 0:
+            loss_items = {k: torch.tensor(v).to(self.device) for k, v in loss_items.items()}
+            return total_loss, loss_items
+        
+        # Calculate losses for each image
+        for i in range(batch_size):
+            gt_bboxes = targets[i][mask_gt[i].squeeze()]  # (n_objects, 5)
+            gt_labels = gt_bboxes[:, 0].long()  # class labels
+            gt_bboxes = gt_bboxes[:, 1:5]  # box coordinates
+            
+            # Get predictions for this image
+            pred_bboxes_i = pred_bboxes[i]
+            pred_scores_i = pred_scores[i]
+            
+            # Assign targets to anchors
+            target_scores, target_bboxes, target_scores_sum, fg_mask = self.assigner(
+                pred_scores_i, pred_bboxes_i, anchors, gt_bboxes, gt_labels)
+            
+            # Calculate box and classification losses
+            if fg_mask.sum():
+                # Box loss
+                box_loss, dfl_loss = self.bbox_loss(
+                    pred_distri[i], pred_bboxes_i, anchors, target_bboxes, target_scores, target_scores_sum, fg_mask)
+                
+                # Class loss
+                cls_loss = self.bce(pred_scores_i, target_scores)
+                cls_loss = cls_loss.sum() / target_scores_sum
+                
+                # Apply loss multipliers
+                box_loss = box_loss * self.hypbox
+                dfl_loss = dfl_loss * self.hypdfl
+                cls_loss = cls_loss * self.hypcls
+                
+                # Update total loss
+                total_loss = total_loss + box_loss + dfl_loss + cls_loss
+                
+                # Update loss items
+                loss_items["box_loss"] += box_loss.item()
+                loss_items["cls_loss"] += cls_loss.item()
+                loss_items["dfl_loss"] += dfl_loss.item()
+        
+        # Average losses over batch
+        for k in loss_items:
+            loss_items[k] /= batch_size
+        
+        # Convert loss items to tensors
+        loss_items = {k: torch.tensor(v).to(self.device) for k, v in loss_items.items()}
+        
+        return total_loss, loss_items
     
 class YoloDetectionModel(nn.Module):
     """YOLOv8 detection model with HuggingFace-compatible interface."""
@@ -1244,6 +1421,11 @@ class YoloDetectionModel(nn.Module):
         """
         if not hasattr(self, 'criterion'):
             self.criterion = self.init_criterion()
+        
+        # Add batch_idx if it doesn't exist in the batch dictionary
+        if 'batch_idx' not in batch:
+            batch['batch_idx'] = 0  # Default to 0 if not provided
+
 
         preds = self.forward(batch['img']) if preds is None else preds
         return self.criterion(preds, batch)  # return losssum, lossitems
@@ -1262,7 +1444,9 @@ class YoloDetectionModel(nn.Module):
         
         if isinstance(m, Detect):
             # YOLOv8 detection loss
-            return myv8DetectionLoss(self.model[-1])
+            #return myv8DetectionLoss(self.model[-1])
+            #return myv8DetectionLoss(self)
+            return YOLOv8DetectionLoss(self)
         elif isinstance(m, IDetect):
             # YOLOv7 detection loss
             from DeepDataMiningLearning.detection.modules.lossv7 import myv7DetectionLoss
