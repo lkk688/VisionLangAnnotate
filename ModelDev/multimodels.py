@@ -1,27 +1,21 @@
+"""Module providing multiple model evaluation and training."""
 import os
-import contextlib
-from copy import deepcopy
-from pathlib import Path
 import numpy as np
 import torch
-import torch.nn as nn
-import yaml
-import re
-from typing import Dict, List, Optional, Tuple, Union
-import time
-import torchvision
 import json
-import glob
 from tqdm import tqdm
 from pycocotools.coco import COCO
 from pycocotools.cocoeval import COCOeval
 import cv2
-from torch.utils.data import Dataset, DataLoader
 from PIL import Image
 
-class MultiWorld:
+from modeling_yolohf import register_yolo_architecture, YoloConfig          
+from transformers import AutoModelForObjectDetection
+from multidatasets import coco_names, DetectionDataset
+
+class MultiModels:
     """
-    MultiWorld class that implements object detection model training, evaluation, and inference
+    MultiModels class that implements object detection model training, evaluation, and inference
     based on the Hugging Face framework. Supports multiple model architectures including:
     - YOLOv8
     - DETR
@@ -32,7 +26,7 @@ class MultiWorld:
     """
     def __init__(self, model=None, config=None, model_type="yolov8", model_name=None, scale='s', device=None):
         """
-        Initialize MultiWorld with a model or create a new one.
+        Initialize MultiModels with a model or create a new one.
         
         Args:
             model: Existing detection model or None to create a new one
@@ -60,7 +54,8 @@ class MultiWorld:
             if model_type == "auto":
                 self.model_type = self._detect_model_type(self.model)
             
-        self.model = self.model.to(self.device)
+        if self.model is not None:
+            self.model = self.model.to(self.device)
         
         # Store or create config
         if hasattr(self.model, 'config'):
@@ -122,11 +117,10 @@ class MultiWorld:
             # Check if a specific model name is provided to load from HF Hub
             if model_name and 'yolo' in model_name.lower():
                 # Register YOLO architecture with HF
-                from modeling_yolohfdetr import register_yolo_architecture
+                #from modeling_yolohfd import register_yolo_architecture
                 register_yolo_architecture()
                 
                 # Load model from Hugging Face Hub
-                from transformers import AutoModelForObjectDetection
                 try:
                     print(f"Loading YOLO model from Hugging Face Hub: {model_name}")
                     model = AutoModelForObjectDetection.from_pretrained(model_name)
@@ -157,10 +151,10 @@ class MultiWorld:
             # Check if this is a YOLO model
             if 'yolo' in model_name.lower():
                 # Register YOLO architecture with HF
-                from modeling_yolohfdetr import register_yolo_architecture
+                #from modeling_yolohf import register_yolo_architecture
                 register_yolo_architecture()
                 
-            from transformers import AutoModelForObjectDetection
+            #from transformers import AutoModelForObjectDetection
             print(f"Loading model from Hugging Face Hub: {model_name}")
             model = AutoModelForObjectDetection.from_pretrained(model_name)
             
@@ -173,18 +167,6 @@ class MultiWorld:
             return model
         except Exception as e:
             print(f"Error loading model from hub: {e}")
-            print("Falling back to YOLOv8")
-            return YoloDetectionModel(
-                cfg=YoloConfig(
-                    scale='s',
-                    nc=80,
-                    ch=3,
-                    min_size=640,
-                    max_size=640,
-                    use_fp16=True if self.device.type == 'cuda' else False
-                ),
-                device=self.device
-            )
     
     def _detect_model_type(self, model, model_name=None):
         """
@@ -471,108 +453,33 @@ class MultiWorld:
     def evaluate_coco(self, dataset, output_dir=None, batch_size=16, conf_thres=0.25, 
                       iou_thres=0.45, max_det=300, convert_format=None):
         """
-        Evaluate the model on a dataset using COCO evaluation metrics.
+        Evaluate the model on a COCO dataset.
         
         Args:
-            dataset: Evaluation dataset
+            dataset: COCO evaluation dataset
             output_dir: Directory to save evaluation results
             batch_size: Batch size for inference
             conf_thres: Confidence threshold for detections
             iou_thres: IoU threshold for NMS
             max_det: Maximum number of detections per image
-            convert_format: Function to convert dataset format to COCO format if needed
+            convert_format: Function to convert dataset to COCO format
             
         Returns:
-            Dictionary with COCO evaluation metrics
+            Dictionary with evaluation metrics
         """
         # Create output directory if provided
         if output_dir:
             os.makedirs(output_dir, exist_ok=True)
         
-        # Set model to evaluation mode
-        self.model.eval()
-        
-        # Create data loader
-        dataloader = torch.utils.data.DataLoader(
-            dataset, 
+        # Run inference on dataset and get detections
+        coco_results = self._run_inference_on_dataset(
+            dataset=dataset,
             batch_size=batch_size,
-            shuffle=False,
-            num_workers=min(8, os.cpu_count() or 1),
-            pin_memory=True,
-            collate_fn=self._collate_fn
+            conf_thres=conf_thres,
+            iou_thres=iou_thres,
+            max_det=max_det,
+            output_dir=output_dir
         )
-        
-        # Initialize COCO format results
-        coco_results = []
-        image_ids = []
-        
-        # Progress bar
-        pbar = tqdm(dataloader, desc="Running inference for COCO evaluation")
-        
-        with torch.no_grad():
-            for batch_idx, batch in enumerate(pbar):
-                # Move batch to device
-                batch_images = batch['img'].to(self.device)
-                
-                # Get image metadata if available
-                if 'image_id' in batch:
-                    batch_image_ids = batch['image_id']
-                else:
-                    # Generate sequential IDs if not provided
-                    batch_image_ids = list(range(
-                        batch_idx * batch_size, 
-                        min((batch_idx + 1) * batch_size, len(dataset))
-                    ))
-                
-                # Store image IDs
-                image_ids.extend(batch_image_ids)
-                
-                # Run inference
-                outputs = self.model(
-                    pixel_values=batch_images,
-                    postprocess=True,
-                    conf_thres=conf_thres,
-                    iou_thres=iou_thres,
-                    max_det=max_det
-                )
-                
-                # Process each image in the batch
-                for i, (output, img_id) in enumerate(zip(outputs, batch_image_ids)):
-                    # Get image size if available
-                    if 'orig_size' in batch:
-                        img_h, img_w = batch['orig_size'][i]
-                    else:
-                        # Use default size if not provided
-                        img_h, img_w = batch_images.shape[2:]
-                    
-                    # Convert predictions to COCO format
-                    pred_boxes = output['boxes'].cpu().numpy()
-                    pred_scores = output['scores'].cpu().numpy()
-                    pred_labels = output['labels'].cpu().numpy()
-                    
-                    # Convert each detection to COCO format and add to results
-                    for box_idx in range(len(pred_boxes)):
-                        x1, y1, x2, y2 = pred_boxes[box_idx]
-                        
-                        # COCO format uses [x, y, width, height]
-                        coco_box = [
-                            float(x1),
-                            float(y1),
-                            float(x2 - x1),
-                            float(y2 - y1)
-                        ]
-                        
-                        # Create COCO detection entry
-                        detection = {
-                            'image_id': int(img_id),
-                            'category_id': int(pred_labels[box_idx]),
-                            'bbox': coco_box,
-                            'score': float(pred_scores[box_idx]),
-                            'area': float((x2 - x1) * (y2 - y1)),
-                            'iscrowd': 0
-                        }
-                        
-                        coco_results.append(detection)
         
         # Save detections to file
         if output_dir:
@@ -594,6 +501,267 @@ class MultiWorld:
         
         # Run COCO evaluation
         results = self._run_coco_evaluation(coco_gt, coco_results, output_dir)
+        
+        return results
+    
+    def _run_inference_on_dataset(self, dataset, batch_size=16, conf_thres=0.25, 
+                                 iou_thres=0.45, max_det=300, output_dir=None,
+                                 output_format='coco'):
+        """
+        Run inference on a dataset and return detections in specified format.
+        
+        Args:
+            dataset: Dataset to run inference on
+            batch_size: Batch size for inference
+            conf_thres: Confidence threshold for detections
+            iou_thres: IoU threshold for NMS
+            max_det: Maximum number of detections per image
+            output_dir: Directory to save visualization results
+            output_format: Format of output detections ('coco' or 'kitti')
+            
+        Returns:
+            List of detections in specified format
+        """
+        # Set model to evaluation mode
+        self.model.eval()
+        
+        # Create data loader
+        dataloader = torch.utils.data.DataLoader(
+            dataset, 
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=min(8, os.cpu_count() or 1),
+            pin_memory=True,
+            collate_fn=getattr(dataset, 'collate_fn', self._collate_fn)
+        )
+        
+        # Initialize results
+        results = []
+        
+        # Progress bar
+        pbar = tqdm(dataloader, desc=f"Running inference for {output_format.upper()} evaluation")
+        
+        with torch.no_grad():
+            for batch_idx, batch in enumerate(pbar):
+                # Handle different batch formats
+                if isinstance(batch, dict):
+                    # Dictionary format
+                    batch_images = batch.get('img', batch.get('pixel_values', batch.get('images')))
+                    if isinstance(batch_images, list):
+                        # Process images with processor if they're not tensors
+                        inputs = self.processor(images=batch_images, return_tensors="pt")
+                        batch_images = inputs["pixel_values"]
+                elif isinstance(batch, (list, tuple)) and len(batch) >= 2:
+                    # Tuple/list format (images, targets)
+                    batch_images = batch[0]
+                    if isinstance(batch[1], dict):
+                        batch = batch[1]
+                        batch['img'] = batch_images
+                else:
+                    print(f"Warning: Unsupported batch format: {type(batch)}")
+                    continue
+                
+                # Move batch to device
+                if isinstance(batch_images, torch.Tensor):
+                    batch_images = batch_images.to(self.device)
+                
+                # Get image metadata if available
+                if isinstance(batch, dict) and 'image_id' in batch:
+                    batch_image_ids = batch['image_id']
+                elif isinstance(batch, dict) and 'img_path' in batch:
+                    # Extract image IDs from file paths
+                    batch_image_ids = [os.path.splitext(os.path.basename(path))[0] for path in batch['img_path']]
+                else:
+                    # Generate sequential IDs if not provided
+                    batch_image_ids = list(range(
+                        batch_idx * batch_size, 
+                        min((batch_idx + 1) * batch_size, len(dataset))
+                    ))
+                
+                # Run inference based on model type
+                try:
+                    if self.model_type == 'yolov8':
+                        # YOLO models expect pixel_values and have postprocess parameter
+                        outputs = self.model(
+                            pixel_values=batch_images,
+                            postprocess=True,
+                            conf_thres=conf_thres,
+                            iou_thres=iou_thres,
+                            max_det=max_det
+                        )
+                    else:
+                        # Try standard HF format first
+                        outputs = self.model(
+                            pixel_values=batch_images
+                        )
+                        
+                        # Post-process if needed
+                        if hasattr(self.processor, 'post_process_object_detection'):
+                            # Get original sizes for proper scaling
+                            if isinstance(batch, dict) and 'orig_size' in batch:
+                                target_sizes = batch['orig_size']
+                            else:
+                                # Use image size if original size not provided
+                                target_sizes = [(batch_images.shape[2], batch_images.shape[3])] * len(batch_images)
+                            
+                            outputs = self.processor.post_process_object_detection(
+                                outputs,
+                                threshold=conf_thres,
+                                target_sizes=target_sizes
+                            )
+                except Exception as e:
+                    print(f"Error during inference: {e}")
+                    continue
+                
+                # Process each image in the batch
+                for i, (output, img_id) in enumerate(zip(outputs, batch_image_ids)):
+                    # Get image size if available
+                    if isinstance(batch, dict) and 'orig_size' in batch:
+                        img_h, img_w = batch['orig_size'][i] if isinstance(batch['orig_size'], list) else batch['orig_size']
+                    else:
+                        # Use default size if not provided
+                        img_h, img_w = batch_images.shape[2:] if len(batch_images.shape) == 4 else (batch_images.shape[1], batch_images.shape[2])
+                    
+                    # Handle different output formats
+                    if isinstance(output, dict):
+                        # Standard format with boxes, scores, labels
+                        pred_boxes = output.get('boxes', [])
+                        pred_scores = output.get('scores', [])
+                        pred_labels = output.get('labels', [])
+                    elif isinstance(output, (list, tuple)) and len(output) >= 3:
+                        # Tuple format (boxes, scores, labels)
+                        pred_boxes, pred_scores, pred_labels = output[:3]
+                    else:
+                        print(f"Warning: Unsupported output format: {type(output)}")
+                        continue
+                    
+                    # Convert tensors to numpy arrays
+                    if isinstance(pred_boxes, torch.Tensor):
+                        pred_boxes = pred_boxes.cpu().numpy()
+                    if isinstance(pred_scores, torch.Tensor):
+                        pred_scores = pred_scores.cpu().numpy()
+                    if isinstance(pred_labels, torch.Tensor):
+                        pred_labels = pred_labels.cpu().numpy()
+                    
+                    # Process detections based on output format
+                    if output_format == 'coco':
+                        # Convert each detection to COCO format
+                        for box_idx in range(len(pred_boxes)):
+                            x1, y1, x2, y2 = pred_boxes[box_idx]
+                            
+                            # COCO format uses [x, y, width, height]
+                            coco_box = [
+                                float(x1),
+                                float(y1),
+                                float(x2 - x1),
+                                float(y2 - y1)
+                            ]
+                            
+                            # Get category ID, handling both string and integer labels
+                            label = pred_labels[box_idx]
+                            if isinstance(label, (str, np.str_)):
+                                # Try to convert string label to integer
+                                if hasattr(self.model, 'config') and hasattr(self.model.config, 'label2id'):
+                                    category_id = int(self.model.config.label2id.get(label, 0))
+                                else:
+                                    # Default to 0 if can't convert
+                                    category_id = 0
+                            else:
+                                category_id = int(label)
+                            
+                            # Create detection entry
+                            detection = {
+                                'image_id': int(img_id) if not isinstance(img_id, str) else hash(img_id) % 10000,
+                                'category_id': category_id,
+                                'bbox': coco_box,
+                                'score': float(pred_scores[box_idx]),
+                                'area': float((x2 - x1) * (y2 - y1)),
+                                'iscrowd': 0
+                            }
+                            
+                            results.append(detection)
+                    
+                    elif output_format == 'kitti':
+                        # Convert each detection to KITTI format
+                        image_results = []
+                        
+                        for box_idx in range(len(pred_boxes)):
+                            x1, y1, x2, y2 = pred_boxes[box_idx]
+                            
+                            # Get category ID and map to KITTI class
+                            label = pred_labels[box_idx]
+                            if isinstance(label, (str, np.str_)):
+                                # Try to convert string label to integer
+                                if hasattr(self.model, 'config') and hasattr(self.model.config, 'label2id'):
+                                    category_id = int(self.model.config.label2id.get(label, 0))
+                                else:
+                                    # Default to 0 if can't convert
+                                    category_id = 0
+                            else:
+                                category_id = int(label)
+                            
+                            # Map COCO class ID to KITTI class name
+                            coco_to_kitti = {
+                                0: 'Pedestrian',  # person
+                                1: 'Cyclist',     # bicycle
+                                2: 'Car',         # car
+                                3: 'Cyclist',     # motorcycle
+                                5: 'Car',         # bus
+                                7: 'Truck',       # truck
+                                9: 'Misc'         # traffic light
+                            }
+                            
+                            kitti_class = coco_to_kitti.get(category_id, 'DontCare')
+                            
+                            # Skip classes that don't map to KITTI
+                            if kitti_class == 'DontCare' and pred_scores[box_idx] < 0.5:
+                                continue
+                            
+                            # Format: type truncated occluded alpha x1 y1 x2 y2 h w l x y z rotation_y score
+                            kitti_line = f"{kitti_class} 0.0 0 0.0 {x1:.2f} {y1:.2f} {x2:.2f} {y2:.2f} 0.0 0.0 0.0 0.0 0.0 0.0 {pred_scores[box_idx]:.6f}"
+                            image_results.append(kitti_line)
+                        
+                        # Add to results
+                        results.append({
+                            'image_id': img_id,
+                            'detections': image_results
+                        })
+                        
+                        # Save detections to file if output directory is provided
+                        if output_dir:
+                            result_file = os.path.join(output_dir, f"{img_id}.txt")
+                            with open(result_file, 'w') as f:
+                                for line in image_results:
+                                    f.write(line + '\n')
+                    
+                    # Visualize if output directory is provided
+                    if output_dir and batch_idx % 10 == 0 and i == 0:  # Visualize every 10th batch, first image
+                        # Try to get original image for visualization
+                        if isinstance(batch, dict) and 'img_orig' in batch:
+                            img_orig = batch['img_orig'][i]
+                        elif isinstance(batch, dict) and 'img_path' in batch:
+                            try:
+                                img_path = batch['img_path'][i] if isinstance(batch['img_path'], list) else batch['img_path']
+                                img_orig = cv2.imread(img_path)
+                            except:
+                                img_orig = None
+                        else:
+                            img_orig = None
+                        
+                        if img_orig is not None:
+                            # Create visualization
+                            vis_result = {
+                                'boxes': pred_boxes,
+                                'scores': pred_scores,
+                                'labels': pred_labels
+                            }
+                            
+                            # Visualize detections
+                            self._visualize_detections(
+                                img_orig,
+                                vis_result,
+                                output_path=os.path.join(output_dir, f"vis_{img_id}.jpg")
+                            )
         
         return results
     
@@ -1005,125 +1173,206 @@ class MultiWorld:
         Returns:
             Dictionary with evaluation metrics
         """
-        # Convert KITTI dataset to COCO format
+        # Create output directory if provided
+        if output_dir:
+            os.makedirs(output_dir, exist_ok=True)
+        
+        # Run inference on dataset and get detections in KITTI format
+        kitti_results = self._run_inference_on_dataset(
+            dataset=kitti_dataset,
+            batch_size=batch_size,
+            conf_thres=conf_thres,
+            iou_thres=iou_thres,
+            max_det=max_det,
+            output_dir=output_dir,
+            output_format='kitti'
+        )
+        
+        # Convert KITTI dataset to COCO format for ground truth
         coco_gt = self.convert_kitti_to_coco(kitti_dataset, kitti_label_dir)
         
+        # Convert KITTI detections to COCO format for evaluation
+        coco_detections = []
+        annotation_id = 0
+        
+        for result in kitti_results:
+            img_id = result['image_id']
+            
+            # Parse KITTI format detections
+            for detection in result['detections']:
+                parts = detection.strip().split()
+                if len(parts) < 15:  # KITTI format should have at least 15 parts
+                    continue
+                
+                obj_type = parts[0]
+                x1, y1, x2, y2 = map(float, parts[4:8])
+                score = float(parts[14])
+                
+                # Map KITTI class to COCO class
+                kitti_to_coco = {
+                    'Car': 2,
+                    'Van': 2,
+                    'Truck': 7,
+                    'Pedestrian': 0,
+                    'Person_sitting': 0,
+                    'Cyclist': 1,
+                    'Tram': 6,
+                    'Misc': 90,
+                    'DontCare': 91
+                }
+                
+                category_id = kitti_to_coco.get(obj_type, 90)
+                
+                # Skip DontCare
+                if category_id == 91:
+                    continue
+                
+                # Create COCO detection entry
+                coco_detections.append({
+                    'image_id': int(img_id) if not isinstance(img_id, str) else hash(img_id) % 10000,
+                    'category_id': category_id,
+                    'bbox': [float(x1), float(y1), float(x2-x1), float(y2-y1)],
+                    'score': score,
+                    'area': float((x2-x1) * (y2-y1)),
+                    'iscrowd': 0
+                })
+        
         # Run COCO evaluation
-        return self.evaluate_coco(
-            kitti_dataset, 
-            output_dir=output_dir, 
-            batch_size=batch_size, 
-            conf_thres=conf_thres, 
-            iou_thres=iou_thres, 
-            max_det=max_det,
-            convert_format=lambda _: coco_gt  # Use already converted ground truth
-        )
+        results = self._run_coco_evaluation(coco_gt, coco_detections, output_dir)
+        
+        return results
         
     def predict(self, image, conf_thres=0.25, iou_thres=0.45, max_det=300, visualize=False, output_path=None):
         """
-        Run inference on an image.
+        Perform object detection on an image.
         
         Args:
-            image: PIL Image, numpy array, or path to image file
-            conf_thres: Confidence threshold
+            image: Path to image file or PIL Image or numpy array
+            conf_thres: Confidence threshold for detections
             iou_thres: IoU threshold for NMS
             max_det: Maximum number of detections
-            visualize: Whether to create a visualization
-            output_path: Path to save visualization (if visualize=True)
+            visualize: Whether to visualize the results
+            output_path: Path to save visualization
             
         Returns:
-            Dictionary with detection results and optionally visualization
+            Dictionary with detection results
         """
-        # Prepare image
+        # Ensure model is in evaluation mode
+        self.model.eval()
+        
+        # Load and preprocess image
         if isinstance(image, str):
             # Load image from file
-            img_orig = cv2.imread(image)
-            if img_orig is None:
-                raise FileNotFoundError(f"Image not found at {image}")
-            img_path = image
+            if os.path.exists(image):
+                if self.model_type in ['yolov8', 'yolov7']:
+                    # For YOLO models, use cv2 to load image
+                    img_orig = cv2.imread(image)
+                    if img_orig is None:
+                        raise FileNotFoundError(f"Image not found or invalid: {image}")
+                    img_rgb = cv2.cvtColor(img_orig, cv2.COLOR_BGR2RGB)
+                    pil_image = Image.fromarray(img_rgb)
+                else:
+                    # For other models, use PIL to load image
+                    pil_image = Image.open(image).convert("RGB")
+                    img_rgb = np.array(pil_image)
+                    img_orig = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
+            else:
+                raise FileNotFoundError(f"Image not found: {image}")
         elif isinstance(image, np.ndarray):
-            # Use provided numpy array
+            # Handle numpy array input
             img_orig = image.copy()
-            img_path = output_path or "detection_result.jpg"
+            if img_orig.shape[2] == 3 and img_orig.dtype == np.uint8:
+                if img_orig.shape[2] == 3:  # Check if it's a color image
+                    # Assume BGR format (cv2 default)
+                    img_rgb = cv2.cvtColor(img_orig, cv2.COLOR_BGR2RGB)
+                    pil_image = Image.fromarray(img_rgb)
+                else:
+                    raise ValueError("Input numpy array must have 3 channels (color image)")
+            else:
+                raise ValueError("Input numpy array must be uint8 with 3 channels")
+        elif isinstance(image, Image.Image):
+            # Handle PIL Image input
+            pil_image = image
+            img_rgb = np.array(pil_image)
+            img_orig = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
         else:
-            # Try to convert from PIL Image
-            try:
-                img_orig = np.array(image)
-                img_orig = cv2.cvtColor(img_orig, cv2.COLOR_RGB2BGR)
-                img_path = output_path or "detection_result.jpg"
-            except Exception as e:
-                raise ValueError(f"Unsupported image type: {type(image)}. Error: {e}")
-        
-        # Convert BGR to RGB for processor
-        img_rgb = cv2.cvtColor(img_orig, cv2.COLOR_BGR2RGB)
-        pil_image = Image.fromarray(img_rgb)
+            raise TypeError("Image must be a path, PIL Image, or numpy array")
         
         # Store original image size
-        orig_size = pil_image.size[::-1]  # (height, width)
+        orig_size = (img_orig.shape[0], img_orig.shape[1])  # (height, width)
         
-        # Preprocess image
+        # Process image using the appropriate processor
         inputs = self.processor(images=pil_image, return_tensors="pt")
-        inputs = {k: v.to(self.device) for k, v in inputs.items()}
         
-        # Apply FP16 if enabled
-        if self.config.use_fp16 and self.device.type == 'cuda':
-            inputs = {k: v.half() for k, v in inputs.items()}
-            
-        # Set model to evaluation mode
-        self.model.eval()
+        # Extract scale factors and padding info if available (for accurate box coordinates)
+        scale_factors = inputs.get("scale_factors", None)
+        padding_info = inputs.get("padding_info", None)
+        
+        # Move inputs to the device
+        inputs = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v for k, v in inputs.items()}
         
         # Run inference
         with torch.no_grad():
-            raw_outputs = self.model(pixel_values=inputs["pixel_values"], 
-                                    postprocess=False,
-                                    conf_thres=conf_thres,
-                                    iou_thres=iou_thres,
-                                    max_det=max_det)
-            
-            # Convert to DETR format
-            if isinstance(raw_outputs, list):
-                outputs = self.model.convert_to_detr_format(raw_outputs)
-            elif isinstance(raw_outputs, torch.Tensor):
-                # Extract boxes, scores, and labels
-                boxes = raw_outputs[..., :4]
-                scores = raw_outputs[..., 4]
-                labels = raw_outputs[..., 5].long()
-                
-                # Create a list of dictionaries for convert_to_detr_format
-                detection_results = [{"boxes": boxes[i], "scores": scores[i], "labels": labels[i]} 
-                                    for i in range(raw_outputs.shape[0])]
-                
-                outputs = self.model.convert_to_detr_format(detection_results)
-            else:
-                outputs = raw_outputs
-            
-            # Post-process
-            if 'pred_logits' in outputs and 'pred_boxes' in outputs:
-                detections = self.processor.post_process_object_detection(
-                    outputs, 
-                    threshold=conf_thres,
-                    target_sizes=[orig_size]
-                )[0]
-            else:
-                # Create compatible format
-                compatible_outputs = {
-                    "logits": outputs.get("pred_logits", torch.zeros((1, 0, 80), device=self.device)),
-                    "pred_boxes": outputs.get("pred_boxes", torch.zeros((1, 0, 4), device=self.device))
-                }
-                detections = self.processor.post_process_object_detection(
-                    compatible_outputs, 
-                    threshold=conf_thres,
-                    target_sizes=[orig_size]
-                )[0]
+            # Get outputs
+            outputs = self.model(**inputs)
         
-        # Create visualization if requested
-        if visualize and len(detections["scores"]) > 0:
-            vis_img = self._visualize_detections(img_orig, detections, output_path)
-            detections["visualization"] = vis_img
-            if output_path:
-                detections["visualization_path"] = output_path
+        # Post-process with scale factors and padding info for accurate box coordinates
+        if hasattr(self.processor, 'post_process_object_detection'):
+            # Use processor's post-processing if available
+            if scale_factors is not None and padding_info is not None:
+                # Use scale factors and padding info for accurate box coordinates
+                results = self.processor.post_process_object_detection(
+                    outputs=outputs,
+                    threshold=conf_thres,
+                    target_sizes=inputs.get("original_sizes", [orig_size]),
+                    scale_factors=scale_factors,
+                    padding_info=padding_info
+                )
+            else:
+                # Fallback to standard post-processing
+                results = self.processor.post_process_object_detection(
+                    outputs=outputs,
+                    threshold=conf_thres,
+                    target_sizes=[orig_size]
+                )
+            
+            # Extract the first result (batch size is 1)
+            result = results[0]
+        else:
+            # Manual post-processing if processor doesn't support it
+            if isinstance(outputs, dict) and "pred_boxes" in outputs:
+                # DETR-style outputs
+                boxes = outputs["pred_boxes"][0].cpu()
+                scores = outputs["pred_logits"][0].sigmoid().max(dim=1)[0].cpu()
+                labels = outputs["pred_logits"][0].sigmoid().max(dim=1)[1].cpu()
                 
-        return detections
+                # Filter by confidence
+                keep = scores > conf_thres
+                boxes = boxes[keep]
+                scores = scores[keep]
+                labels = labels[keep]
+                
+                # Convert normalized boxes to pixel coordinates
+                boxes[:, 0::2] *= orig_size[1]  # scale x by width
+                boxes[:, 1::2] *= orig_size[0]  # scale y by height
+                
+                result = {
+                    "boxes": boxes,
+                    "scores": scores,
+                    "labels": labels
+                }
+            elif isinstance(outputs, list) and len(outputs) > 0 and isinstance(outputs[0], dict):
+                # YOLO-style outputs (list of dicts)
+                result = outputs[0]
+            else:
+                raise ValueError(f"Unsupported output format from model: {type(outputs)}")
+        
+        # Visualize results if requested
+        if visualize:
+            result_vis = self._visualize_detections(img_orig, result, output_path)
+            result["visualization"] = result_vis
+        
+        return result
     
     def _visualize_detections(self, image, detections, output_path=None):
         """
@@ -1180,12 +1429,13 @@ class MultiWorld:
     
     def train(self, train_dataset, val_dataset=None, epochs=100, batch_size=16, 
               learning_rate=0.01, weight_decay=0.0005, output_dir="./runs/train", 
-              resume=None, save_interval=10):
+              resume=None, save_interval=10, optimizer_type='sgd', scheduler_type='cosine',
+              warmup_epochs=3, gradient_accumulation_steps=1, mixed_precision=False):
         """
         Train the model on a dataset.
         
         Args:
-            train_dataset: Training dataset (must be compatible with YOLO format)
+            train_dataset: Training dataset
             val_dataset: Validation dataset (optional)
             epochs: Number of training epochs
             batch_size: Batch size
@@ -1194,6 +1444,11 @@ class MultiWorld:
             output_dir: Directory to save checkpoints and logs
             resume: Path to checkpoint to resume training from
             save_interval: Save checkpoint every N epochs
+            optimizer_type: Type of optimizer ('sgd', 'adam', 'adamw')
+            scheduler_type: Type of scheduler ('cosine', 'step', 'linear', 'constant')
+            warmup_epochs: Number of warmup epochs for learning rate
+            gradient_accumulation_steps: Number of steps to accumulate gradients
+            mixed_precision: Whether to use mixed precision training
             
         Returns:
             Dictionary with training results
@@ -1204,8 +1459,8 @@ class MultiWorld:
         # Set model to training mode
         self.model.train()
         
-        # Initialize criterion if not already done
-        if not hasattr(self.model, 'criterion'):
+        # Initialize criterion if not already done and model supports it
+        if hasattr(self.model, 'init_criterion') and not hasattr(self.model, 'criterion'):
             self.model.criterion = self.model.init_criterion()
         
         # Create data loaders
@@ -1231,19 +1486,70 @@ class MultiWorld:
             val_loader = None
         
         # Initialize optimizer
-        optimizer = torch.optim.SGD(
-            self.model.parameters(),
-            lr=learning_rate,
-            momentum=0.937,
-            weight_decay=weight_decay
-        )
+        if optimizer_type.lower() == 'sgd':
+            optimizer = torch.optim.SGD(
+                self.model.parameters(),
+                lr=learning_rate,
+                momentum=0.937,
+                weight_decay=weight_decay
+            )
+        elif optimizer_type.lower() == 'adam':
+            optimizer = torch.optim.Adam(
+                self.model.parameters(),
+                lr=learning_rate,
+                weight_decay=weight_decay
+            )
+        elif optimizer_type.lower() == 'adamw':
+            optimizer = torch.optim.AdamW(
+                self.model.parameters(),
+                lr=learning_rate,
+                weight_decay=weight_decay
+            )
+        else:
+            raise ValueError(f"Unsupported optimizer type: {optimizer_type}")
         
         # Initialize learning rate scheduler
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer, 
-            T_max=epochs,
-            eta_min=learning_rate / 100
-        )
+        if scheduler_type.lower() == 'cosine':
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer, 
+                T_max=epochs - warmup_epochs,
+                eta_min=learning_rate / 100
+            )
+        elif scheduler_type.lower() == 'step':
+            scheduler = torch.optim.lr_scheduler.StepLR(
+                optimizer,
+                step_size=epochs // 3,
+                gamma=0.1
+            )
+        elif scheduler_type.lower() == 'linear':
+            scheduler = torch.optim.lr_scheduler.LinearLR(
+                optimizer,
+                start_factor=1.0,
+                end_factor=0.01,
+                total_iters=epochs - warmup_epochs
+            )
+        elif scheduler_type.lower() == 'constant':
+            scheduler = torch.optim.lr_scheduler.ConstantLR(
+                optimizer,
+                factor=1.0,
+                total_iters=epochs
+            )
+        else:
+            raise ValueError(f"Unsupported scheduler type: {scheduler_type}")
+        
+        # Initialize warmup scheduler if needed
+        if warmup_epochs > 0:
+            warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
+                optimizer,
+                start_factor=0.1,
+                end_factor=1.0,
+                total_iters=warmup_epochs
+            )
+        else:
+            warmup_scheduler = None
+        
+        # Setup mixed precision training if requested
+        scaler = torch.cuda.amp.GradScaler() if mixed_precision else None
         
         # Resume training if checkpoint provided
         start_epoch = 0
@@ -1252,7 +1558,8 @@ class MultiWorld:
                 checkpoint = torch.load(resume, map_location=self.device)
                 self.model.load_state_dict(checkpoint['model'])
                 optimizer.load_state_dict(checkpoint['optimizer'])
-                scheduler.load_state_dict(checkpoint['scheduler'])
+                if 'scheduler' in checkpoint:
+                    scheduler.load_state_dict(checkpoint['scheduler'])
                 start_epoch = checkpoint['epoch'] + 1
                 print(f"Resumed training from epoch {start_epoch}")
             else:
@@ -1271,10 +1578,20 @@ class MultiWorld:
         print(f"Starting training for {epochs} epochs...")
         for epoch in range(start_epoch, epochs):
             # Train for one epoch
-            train_loss = self._train_one_epoch(train_loader, optimizer, epoch)
+            train_loss = self._train_one_epoch(
+                train_loader, 
+                optimizer, 
+                epoch, 
+                scaler=scaler, 
+                gradient_accumulation_steps=gradient_accumulation_steps
+            )
             
             # Update learning rate
-            scheduler.step()
+            if epoch < warmup_epochs and warmup_scheduler:
+                warmup_scheduler.step()
+            else:
+                scheduler.step()
+            
             current_lr = optimizer.param_groups[0]['lr']
             
             # Validate if validation dataset is provided
@@ -1324,7 +1641,7 @@ class MultiWorld:
             
         return training_results
     
-    def _train_one_epoch(self, dataloader, optimizer, epoch):
+    def _train_one_epoch(self, dataloader, optimizer, epoch, scaler=None, gradient_accumulation_steps=1):
         """
         Train for one epoch.
         
@@ -1332,6 +1649,8 @@ class MultiWorld:
             dataloader: Training data loader
             optimizer: Optimizer
             epoch: Current epoch number
+            scaler: GradScaler for mixed precision training
+            gradient_accumulation_steps: Number of steps to accumulate gradients
             
         Returns:
             Average loss for the epoch
@@ -1342,22 +1661,76 @@ class MultiWorld:
         # Progress bar
         pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}")
         
+        # Reset gradients at the beginning of the epoch
+        optimizer.zero_grad()
+        
         for batch_idx, batch in enumerate(pbar):
             # Move batch to device
             batch = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v 
                     for k, v in batch.items()}
             
-            # Zero gradients
-            optimizer.zero_grad()
-            
-            # Forward pass
-            loss, loss_items = self.model.loss(batch)
-            
-            # Backward pass
-            loss.backward()
-            
-            # Update weights
-            optimizer.step()
+            # Forward pass with mixed precision if scaler is provided
+            if scaler:
+                with torch.cuda.amp.autocast():
+                    # Handle different model types
+                    if hasattr(self.model, 'loss'):
+                        # YOLO-style models
+                        loss, loss_items = self.model.loss(batch)
+                    elif 'labels' in batch:
+                        # HuggingFace-style models
+                        outputs = self.model(
+                            pixel_values=batch.get('pixel_values', batch.get('img')),
+                            labels=batch.get('labels', batch.get('target'))
+                        )
+                        loss = outputs.loss
+                        loss_items = {'loss': loss.item()}
+                    else:
+                        # Generic case - try to infer inputs and outputs
+                        outputs = self.model(**batch)
+                        if isinstance(outputs, dict) and 'loss' in outputs:
+                            loss = outputs['loss']
+                        else:
+                            loss = outputs
+                        loss_items = {'loss': loss.item()}
+                
+                # Backward pass with gradient scaling
+                scaler.scale(loss / gradient_accumulation_steps).backward()
+                
+                # Update weights with gradient accumulation
+                if (batch_idx + 1) % gradient_accumulation_steps == 0 or batch_idx == len(dataloader) - 1:
+                    scaler.step(optimizer)
+                    scaler.update()
+                    optimizer.zero_grad()
+            else:
+                # Standard training without mixed precision
+                # Handle different model types
+                if hasattr(self.model, 'loss'):
+                    # YOLO-style models
+                    loss, loss_items = self.model.loss(batch)
+                elif 'labels' in batch:
+                    # HuggingFace-style models
+                    outputs = self.model(
+                        pixel_values=batch.get('pixel_values', batch.get('img')),
+                        labels=batch.get('labels', batch.get('target'))
+                    )
+                    loss = outputs.loss
+                    loss_items = {'loss': loss.item()}
+                else:
+                    # Generic case - try to infer inputs and outputs
+                    outputs = self.model(**batch)
+                    if isinstance(outputs, dict) and 'loss' in outputs:
+                        loss = outputs['loss']
+                    else:
+                        loss = outputs
+                    loss_items = {'loss': loss.item()}
+                
+                # Backward pass with gradient accumulation
+                (loss / gradient_accumulation_steps).backward()
+                
+                # Update weights with gradient accumulation
+                if (batch_idx + 1) % gradient_accumulation_steps == 0 or batch_idx == len(dataloader) - 1:
+                    optimizer.step()
+                    optimizer.zero_grad()
             
             # Update progress bar
             total_loss += loss.item()
@@ -1366,7 +1739,7 @@ class MultiWorld:
         
         return avg_loss
     
-    def _validate(self, dataloader, epoch):
+        def _validate(self, dataloader, epoch):
         """
         Validate the model on a dataset.
         
@@ -1389,8 +1762,24 @@ class MultiWorld:
                 batch = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v 
                         for k, v in batch.items()}
                 
-                # Forward pass
-                loss, loss_items = self.model.loss(batch)
+                # Handle different model types
+                if hasattr(self.model, 'loss'):
+                    # YOLO-style models
+                    loss, loss_items = self.model.loss(batch)
+                elif 'labels' in batch:
+                    # HuggingFace-style models
+                    outputs = self.model(
+                        pixel_values=batch.get('pixel_values', batch.get('img')),
+                        labels=batch.get('labels', batch.get('target'))
+                    )
+                    loss = outputs.loss
+                else:
+                    # Generic case - try to infer inputs and outputs
+                    outputs = self.model(**batch)
+                    if isinstance(outputs, dict) and 'loss' in outputs:
+                        loss = outputs['loss']
+                    else:
+                        loss = outputs
                 
                 # Update progress bar
                 total_loss += loss.item()
@@ -1425,98 +1814,7 @@ class MultiWorld:
             'target': targets
         }
     
-    def evaluate(self, dataset, batch_size=16, conf_thres=0.25, iou_thres=0.45, 
-                max_det=300, output_dir=None):
-        """
-        Evaluate the model on a dataset.
-        
-        Args:
-            dataset: Evaluation dataset
-            batch_size: Batch size
-            conf_thres: Confidence threshold
-            iou_thres: IoU threshold for NMS
-            max_det: Maximum number of detections
-            output_dir: Directory to save evaluation results
-            
-        Returns:
-            Dictionary with evaluation metrics
-        """
-        # Create output directory if provided
-        if output_dir:
-            os.makedirs(output_dir, exist_ok=True)
-        
-        # Set model to evaluation mode
-        self.model.eval()
-        
-        # Create data loader
-        dataloader = torch.utils.data.DataLoader(
-            dataset, 
-            batch_size=batch_size,
-            shuffle=False,
-            num_workers=min(8, os.cpu_count() or 1),
-            pin_memory=True,
-            collate_fn=self._collate_fn
-        )
-        
-        # Initialize metrics
-        stats = []
-        
-        # Progress bar
-        pbar = tqdm(dataloader, desc="Evaluating")
-        
-        with torch.no_grad():
-            for batch_idx, batch in enumerate(pbar):
-                # Move batch to device
-                batch_images = batch['img'].to(self.device)
-                
-                # Get ground truth
-                targets = batch['target']
-                
-                # Run inference
-                outputs = self.model(
-                    pixel_values=batch_images,
-                    postprocess=True,
-                    conf_thres=conf_thres,
-                    iou_thres=iou_thres,
-                    max_det=max_det
-                )
-                
-                # Process each image in the batch
-                for i, (output, target) in enumerate(zip(outputs, targets)):
-                    # Convert predictions to expected format
-                    pred_boxes = output['boxes'].cpu().numpy()
-                    pred_scores = output['scores'].cpu().numpy()
-                    pred_labels = output['labels'].cpu().numpy()
-                    
-                    # Convert ground truth to expected format
-                    gt_boxes = target['boxes'].cpu().numpy()
-                    gt_labels = target['labels'].cpu().numpy()
-                    
-                    # Compute metrics for this image
-                    image_metrics = self._compute_metrics(
-                        pred_boxes, pred_scores, pred_labels,
-                        gt_boxes, gt_labels,
-                        iou_thres=iou_thres
-                    )
-                    
-                    # Add image index and batch index
-                    image_metrics['batch_idx'] = batch_idx
-                    image_metrics['image_idx'] = batch_idx * batch_size + i
-                    
-                    # Add to stats
-                    stats.append(image_metrics)
-        
-        # Compute overall metrics
-        eval_results = self._summarize_metrics(stats)
-        
-        # Save evaluation results if output directory is provided
-        if output_dir:
-            with open(os.path.join(output_dir, "eval_results.json"), 'w') as f:
-                json.dump(eval_results, f, indent=2)
-            print(f"Evaluation results saved to {output_dir}/eval_results.json")
-        
-        return eval_results
-    
+    #not used
     def _compute_metrics(self, pred_boxes, pred_scores, pred_labels, 
                         gt_boxes, gt_labels, iou_thres=0.5):
         """
@@ -1688,819 +1986,7 @@ class MultiWorld:
             summary['overall_f1'] = 0
         
         return summary
-
-# COCO class names dictionary
-coco_names = {
-    0: 'person', 1: 'bicycle', 2: 'car', 3: 'motorcycle', 4: 'airplane', 5: 'bus',
-    6: 'train', 7: 'truck', 8: 'boat', 9: 'traffic light', 10: 'fire hydrant',
-    11: 'stop sign', 12: 'parking meter', 13: 'bench', 14: 'bird', 15: 'cat',
-    16: 'dog', 17: 'horse', 18: 'sheep', 19: 'cow', 20: 'elephant',
-    21: 'bear', 22: 'zebra', 23: 'giraffe', 24: 'backpack', 25: 'umbrella',
-    26: 'handbag', 27: 'tie', 28: 'suitcase', 29: 'frisbee', 30: 'skis',
-    31: 'snowboard', 32: 'sports ball', 33: 'kite', 34: 'baseball bat', 35: 'baseball glove',
-    36: 'skateboard', 37: 'surfboard', 38: 'tennis racket', 39: 'bottle', 40: 'wine glass',
-    41: 'cup', 42: 'fork', 43: 'knife', 44: 'spoon', 45: 'bowl',
-    46: 'banana', 47: 'apple', 48: 'sandwich', 49: 'orange', 50: 'broccoli',
-    51: 'carrot', 52: 'hot dog', 53: 'pizza', 54: 'donut', 55: 'cake',
-    56: 'chair', 57: 'couch', 58: 'potted plant', 59: 'bed', 60: 'dining table',
-    61: 'toilet', 62: 'tv', 63: 'laptop', 64: 'mouse', 65: 'remote',
-    66: 'keyboard', 67: 'cell phone', 68: 'microwave', 69: 'oven', 70: 'toaster',
-    71: 'sink', 72: 'refrigerator', 73: 'book', 74: 'clock', 75: 'vase',
-    76: 'scissors', 77: 'teddy bear', 78: 'hair drier', 79: 'toothbrush'
-}
-
-class DetectionDataset(Dataset):
-    """
-    Universal detection dataset class that supports COCO, KITTI, and other formats.
-    Handles class mapping to standardize on COCO's 80 classes.
-    """
-    def __init__(self, 
-                 dataset_type='coco',
-                 data_dir=None, 
-                 annotation_file=None,
-                 image_dir=None,
-                 split='train',
-                 transforms=None,
-                 target_size=(640, 640),
-                 cache_images=False,
-                 class_map=None):
-        """
-        Initialize the detection dataset.
-        
-        Args:
-            dataset_type: Type of dataset ('coco', 'kitti', 'voc', etc.)
-            data_dir: Root directory of the dataset
-            annotation_file: Path to annotation file (for COCO)
-            image_dir: Directory containing images
-            split: Dataset split ('train', 'val', 'test')
-            transforms: Image transformations
-            target_size: Target image size (height, width)
-            cache_images: Whether to cache images in memory
-            class_map: Custom class mapping dictionary
-        """
-        self.dataset_type = dataset_type.lower()
-        self.data_dir = data_dir
-        self.annotation_file = annotation_file
-        self.image_dir = image_dir
-        self.split = split
-        self.transforms = transforms
-        self.target_size = target_size
-        self.cache_images = cache_images
-        
-        # Initialize class mapping
-        self.class_map = class_map or self._get_default_class_map(dataset_type)
-        
-        # Initialize COCO class names (standard 80 classes)
-        self.coco_names = coco_names
-        
-        # Load dataset based on type
-        self._load_dataset()
-        
-        # Cache for images
-        self.img_cache = {} if cache_images else None
-        
-    def _get_default_class_map(self, dataset_type):
-        """
-        Get default class mapping for the specified dataset type.
-        Maps dataset-specific classes to COCO classes.
-        
-        Args:
-            dataset_type: Type of dataset
-            
-        Returns:
-            Dictionary mapping dataset classes to COCO classes
-        """
-        if dataset_type == 'coco':
-            # COCO is already using the standard classes
-            return {i: i for i in range(80)}
-        
-        elif dataset_type == 'kitti':
-            # KITTI to COCO class mapping
-            return {
-                'Car': 2,         # car in COCO
-                'Van': 2,         # car in COCO
-                'Truck': 7,       # truck in COCO
-                'Pedestrian': 0,  # person in COCO
-                'Person_sitting': 0,  # person in COCO
-                'Cyclist': 1,     # bicycle in COCO
-                'Tram': 6,        # train in COCO
-                'Misc': -1,       # ignore
-                'DontCare': -1    # ignore
-            }
-        
-        elif dataset_type == 'voc':
-            # Pascal VOC to COCO class mapping
-            return {
-                'aeroplane': 4,    # airplane in COCO
-                'bicycle': 1,      # bicycle in COCO
-                'bird': 14,        # bird in COCO
-                'boat': 8,         # boat in COCO
-                'bottle': 39,      # bottle in COCO
-                'bus': 5,          # bus in COCO
-                'car': 2,          # car in COCO
-                'cat': 15,         # cat in COCO
-                'chair': 56,       # chair in COCO
-                'cow': 19,         # cow in COCO
-                'diningtable': 60, # dining table in COCO
-                'dog': 16,         # dog in COCO
-                'horse': 17,       # horse in COCO
-                'motorbike': 3,    # motorcycle in COCO
-                'person': 0,       # person in COCO
-                'pottedplant': 58, # potted plant in COCO
-                'sheep': 18,       # sheep in COCO
-                'sofa': 57,        # couch in COCO
-                'train': 6,        # train in COCO
-                'tvmonitor': 62    # tv in COCO
-            }
-        
-        else:
-            # Default empty mapping
-            return {}
-    
-    def _load_dataset(self):
-        """
-        Load dataset based on type.
-        """
-        if self.dataset_type == 'coco':
-            self._load_coco_dataset()
-        elif self.dataset_type == 'kitti':
-            self._load_kitti_dataset()
-        elif self.dataset_type == 'voc':
-            self._load_voc_dataset()
-        else:
-            raise ValueError(f"Unsupported dataset type: {self.dataset_type}")
-    
-    def _load_coco_dataset(self):
-        """
-        Load COCO dataset.
-        """
-        # Determine annotation file if not provided
-        if self.annotation_file is None and self.data_dir is not None:
-            if self.split == 'train':
-                self.annotation_file = os.path.join(self.data_dir, 'annotations', 'instances_train2017.json')
-            elif self.split == 'val':
-                self.annotation_file = os.path.join(self.data_dir, 'annotations', 'instances_val2017.json')
-            else:
-                raise ValueError(f"Unsupported COCO split: {self.split}")
-        
-        # Determine image directory if not provided
-        if self.image_dir is None and self.data_dir is not None:
-            if self.split == 'train':
-                self.image_dir = os.path.join(self.data_dir, 'train2017')
-            elif self.split == 'val':
-                self.image_dir = os.path.join(self.data_dir, 'val2017')
-            else:
-                raise ValueError(f"Unsupported COCO split: {self.split}")
-        
-        # Load COCO annotations
-        self.coco = COCO(self.annotation_file)
-        
-        # Get image IDs
-        self.image_ids = list(sorted(self.coco.imgs.keys()))
-        
-        # Create category ID to COCO class ID mapping
-        self.cat_id_to_coco_id = {}
-        for cat_id in self.coco.cats.keys():
-            # Map COCO category ID to standard COCO class ID (0-79)
-            # This is needed because COCO category IDs are not sequential
-            cat_name = self.coco.cats[cat_id]['name']
-            for coco_id, name in self.coco_names.items():
-                if name.lower() == cat_name.lower():
-                    self.cat_id_to_coco_id[cat_id] = coco_id
-                    break
-            else:
-                # If not found, map to -1 (ignore)
-                self.cat_id_to_coco_id[cat_id] = -1
-        
-        print(f"Loaded COCO dataset with {len(self.image_ids)} images")
-    
-    def _load_kitti_dataset(self):
-        """
-        Load KITTI dataset.
-        """
-        # Determine data directories if not provided
-        if self.data_dir is not None:
-            if self.image_dir is None:
-                self.image_dir = os.path.join(self.data_dir, 'training', 'image_2')
-            
-            self.label_dir = os.path.join(self.data_dir, 'training', 'label_2')
-            
-            # For validation split, we'll use a subset of the training data
-            # since KITTI doesn't have an official train/val split
-            if self.split == 'val':
-                val_ratio = 0.2
-                all_images = sorted(glob.glob(os.path.join(self.image_dir, '*.png')))
-                num_val = int(len(all_images) * val_ratio)
-                self.image_paths = all_images[-num_val:]
-            else:
-                self.image_paths = sorted(glob.glob(os.path.join(self.image_dir, '*.png')))
-        else:
-            raise ValueError("Data directory must be provided for KITTI dataset")
-        
-        # Create KITTI class name to class ID mapping
-        self.kitti_name_to_id = {
-            'Car': 0,
-            'Van': 1,
-            'Truck': 2,
-            'Pedestrian': 3,
-            'Person_sitting': 4,
-            'Cyclist': 5,
-            'Tram': 6,
-            'Misc': 7,
-            'DontCare': 8
-        }
-        
-        print(f"Loaded KITTI dataset with {len(self.image_paths)} images")
-    
-    def _load_voc_dataset(self):
-        """
-        Load Pascal VOC dataset.
-        """
-        # Determine data directories if not provided
-        if self.data_dir is not None:
-            if self.image_dir is None:
-                self.image_dir = os.path.join(self.data_dir, 'JPEGImages')
-            
-            # Set annotation directory
-            self.annotation_dir = os.path.join(self.data_dir, 'Annotations')
-            
-            # Load image IDs from the appropriate split
-            split_file = os.path.join(
-                self.data_dir, 'ImageSets', 'Main', 
-                f"{self.split}.txt"
-            )
-            
-            with open(split_file, 'r') as f:
-                self.image_ids = [line.strip() for line in f.readlines()]
-        else:
-            raise ValueError("Data directory must be provided for VOC dataset")
-        
-        # Create VOC class name to class ID mapping
-        self.voc_name_to_id = {
-            'aeroplane': 0,
-            'bicycle': 1,
-            'bird': 2,
-            'boat': 3,
-            'bottle': 4,
-            'bus': 5,
-            'car': 6,
-            'cat': 7,
-            'chair': 8,
-            'cow': 9,
-            'diningtable': 10,
-            'dog': 11,
-            'horse': 12,
-            'motorbike': 13,
-            'person': 14,
-            'pottedplant': 15,
-            'sheep': 16,
-            'sofa': 17,
-            'train': 18,
-            'tvmonitor': 19
-        }
-        
-        print(f"Loaded VOC dataset with {len(self.image_ids)} images")
-    
-    def __len__(self):
-        """
-        Get the length of the dataset.
-        
-        Returns:
-            Number of samples in the dataset
-        """
-        if self.dataset_type == 'coco':
-            return len(self.image_ids)
-        elif self.dataset_type == 'kitti':
-            return len(self.image_paths)
-        elif self.dataset_type == 'voc':
-            return len(self.image_ids)
-        else:
-            return 0
-    
-    def __getitem__(self, idx):
-        """
-        Get a sample from the dataset.
-        
-        Args:
-            idx: Sample index
-            
-        Returns:
-            Dictionary with image and target
-        """
-        if self.dataset_type == 'coco':
-            return self._get_coco_item(idx)
-        elif self.dataset_type == 'kitti':
-            return self._get_kitti_item(idx)
-        elif self.dataset_type == 'voc':
-            return self._get_voc_item(idx)
-        else:
-            raise ValueError(f"Unsupported dataset type: {self.dataset_type}")
-    
-    def _get_coco_item(self, idx):
-        """
-        Get a sample from COCO dataset.
-        
-        Args:
-            idx: Sample index
-            
-        Returns:
-            Dictionary with image and target
-        """
-        # Get image ID
-        img_id = self.image_ids[idx]
-        
-        # Check if image is cached
-        if self.cache_images and img_id in self.img_cache:
-            img = self.img_cache[img_id]
-        else:
-            # Load image
-            img_info = self.coco.loadImgs(img_id)[0]
-            img_path = os.path.join(self.image_dir, img_info['file_name'])
-            img = cv2.imread(img_path)
-            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-            
-            # Cache image if enabled
-            if self.cache_images:
-                self.img_cache[img_id] = img
-        
-        # Get annotations
-        ann_ids = self.coco.getAnnIds(imgIds=img_id)
-        anns = self.coco.loadAnns(ann_ids)
-        
-        # Extract boxes and labels
-        boxes = []
-        labels = []
-        areas = []
-        iscrowd = []
-        
-        for ann in anns:
-            # Skip annotations with no area or marked as crowd
-            if ann['area'] < 1 or ann['iscrowd']:
-                continue
-            
-            # Get category ID and map to COCO class ID
-            cat_id = ann['category_id']
-            coco_class_id = self.cat_id_to_coco_id.get(cat_id, -1)
-            
-            # Skip categories that don't map to a COCO class
-            if coco_class_id == -1:
-                continue
-            
-            # Get bounding box
-            x, y, w, h = ann['bbox']
-            
-            # Convert to (x1, y1, x2, y2) format
-            x1 = max(0, x)
-            y1 = max(0, y)
-            x2 = min(img.shape[1], x + w)
-            y2 = min(img.shape[0], y + h)
-            
-            # Skip invalid boxes
-            if x2 <= x1 or y2 <= y1:
-                continue
-            
-            boxes.append([x1, y1, x2, y2])
-            labels.append(coco_class_id)
-            areas.append(ann['area'])
-            iscrowd.append(ann['iscrowd'])
-        
-        # Convert to tensors
-        boxes = torch.as_tensor(boxes, dtype=torch.float32)
-        labels = torch.as_tensor(labels, dtype=torch.int64)
-        areas = torch.as_tensor(areas, dtype=torch.float32)
-        iscrowd = torch.as_tensor(iscrowd, dtype=torch.int64)
-        
-        # Create target dictionary
-        target = {
-            'boxes': boxes,
-            'labels': labels,
-            'image_id': torch.tensor([img_id]),
-            'area': areas,
-            'iscrowd': iscrowd,
-            'orig_size': torch.as_tensor([img.shape[0], img.shape[1]], dtype=torch.int64)
-        }
-        
-        # Apply transformations if provided
-        if self.transforms:
-            img, target = self.transforms(img, target)
-        else:
-            # Resize image to target size
-            img_pil = Image.fromarray(img)
-            img_pil = img_pil.resize(self.target_size[::-1])  # PIL uses (width, height)
-            img = np.array(img_pil)
-            
-            # Normalize pixel values to [0, 1]
-            img = img.astype(np.float32) / 255.0
-            
-            # Convert to tensor
-            img = torch.from_numpy(img).permute(2, 0, 1)  # (H, W, C) -> (C, H, W)
-            
-            # Scale boxes to new image size
-            if len(boxes) > 0:
-                h_ratio = self.target_size[0] / img_info['height']
-                w_ratio = self.target_size[1] / img_info['width']
                 
-                # Scale boxes
-                scaled_boxes = boxes.clone()
-                scaled_boxes[:, 0] *= w_ratio  # x1
-                scaled_boxes[:, 1] *= h_ratio  # y1
-                scaled_boxes[:, 2] *= w_ratio  # x2
-                scaled_boxes[:, 3] *= h_ratio  # y2
-                
-                target['boxes'] = scaled_boxes
-        
-        return {'img': img, 'target': target, 'image_id': img_id}
-    
-    def _get_kitti_item(self, idx):
-        """
-        Get a sample from KITTI dataset.
-        
-        Args:
-            idx: Sample index
-            
-        Returns:
-            Dictionary with image and target
-        """
-        # Get image path
-        img_path = self.image_paths[idx]
-        img_id = os.path.basename(img_path).split('.')[0]
-        
-        # Check if image is cached
-        if self.cache_images and img_id in self.img_cache:
-            img = self.img_cache[img_id]
-        else:
-            # Load image
-            img = cv2.imread(img_path)
-            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-            
-            # Cache image if enabled
-            if self.cache_images:
-                self.img_cache[img_id] = img
-        
-        # Get label file path
-        label_path = os.path.join(self.label_dir, f"{img_id}.txt")
-        
-        # Extract boxes and labels
-        boxes = []
-        labels = []
-        
-        if os.path.exists(label_path):
-            with open(label_path, 'r') as f:
-                for line in f:
-                    parts = line.strip().split()
-                    if len(parts) < 9:
-                        continue
-                    
-                    # Parse KITTI format
-                    obj_type = parts[0]
-                    truncated = float(parts[1])
-                    occluded = int(parts[2])
-                    alpha = float(parts[3])
-                    x1, y1, x2, y2 = map(float, parts[4:8])
-                    
-                    # Skip DontCare or objects with very high truncation/occlusion
-                    if obj_type == 'DontCare' or truncated > 0.8 or occluded > 2:
-                        continue
-                    
-                    # Map KITTI class to COCO class
-                    if obj_type in self.class_map:
-                        coco_class_id = self.class_map[obj_type]
-                    else:
-                        # Skip classes that don't map to a COCO class
-                        continue
-                    
-                    # Skip ignored classes
-                    if coco_class_id == -1:
-                        continue
-                    
-                    boxes.append([x1, y1, x2, y2])
-                    labels.append(coco_class_id)
-        
-        # Convert to tensors
-        boxes = torch.as_tensor(boxes, dtype=torch.float32)
-        labels = torch.as_tensor(labels, dtype=torch.int64)
-        
-        # Create target dictionary
-        target = {
-            'boxes': boxes,
-            'labels': labels,
-            'image_id': torch.tensor([int(img_id) if img_id.isdigit() else hash(img_id) % 10000]),
-            'area': (boxes[:, 2] - boxes[:, 0]) * (boxes[:, 3] - boxes[:, 1]) if len(boxes) > 0 else torch.tensor([]),
-            'iscrowd': torch.zeros((len(boxes),), dtype=torch.int64),
-            'orig_size': torch.as_tensor([img.shape[0], img.shape[1]], dtype=torch.int64)
-        }
-        
-        # Apply transformations if provided
-        if self.transforms:
-            img, target = self.transforms(img, target)
-        else:
-            # Resize image to target size
-            img_pil = Image.fromarray(img)
-            img_pil = img_pil.resize(self.target_size[::-1])  # PIL uses (width, height)
-            img = np.array(img_pil)
-            
-            # Normalize pixel values to [0, 1]
-            img = img.astype(np.float32) / 255.0
-            
-            # Convert to tensor
-            img = torch.from_numpy(img).permute(2, 0, 1)  # (H, W, C) -> (C, H, W)
-            
-            # Scale boxes to new image size
-            if len(boxes) > 0:
-                h_ratio = self.target_size[0] / target['orig_size'][0].item()
-                w_ratio = self.target_size[1] / target['orig_size'][1].item()
-                
-                # Scale boxes
-                scaled_boxes = boxes.clone()
-                scaled_boxes[:, 0] *= w_ratio  # x1
-                scaled_boxes[:, 1] *= h_ratio  # y1
-                scaled_boxes[:, 2] *= w_ratio  # x2
-                scaled_boxes[:, 3] *= h_ratio  # y2
-                
-                target['boxes'] = scaled_boxes
-        
-        return {'img': img, 'target': target, 'image_id': img_id}
-    
-    def _get_voc_item(self, idx):
-        """
-        Get a sample from VOC dataset.
-        
-        Args:
-            idx: Sample index
-            
-        Returns:
-            Dictionary with image and target
-        """
-        # Get image ID
-        img_id = self.image_ids[idx]
-        
-        # Check if image is cached
-        if self.cache_images and img_id in self.img_cache:
-            img = self.img_cache[img_id]
-        else:
-            # Load image
-            img_path = os.path.join(self.image_dir, f"{img_id}.jpg")
-            img = cv2.imread(img_path)
-            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-            
-            # Cache image if enabled
-            if self.cache_images:
-                self.img_cache[img_id] = img
-        
-        # Get annotation file path
-        ann_path = os.path.join(self.annotation_dir, f"{img_id}.xml")
-        
-        # Extract boxes and labels
-        boxes = []
-        labels = []
-        
-        # Parse XML annotation file
-        import xml.etree.ElementTree as ET
-        tree = ET.parse(ann_path)
-        root = tree.getroot()
-        
-        # Get image size
-        size = root.find('size')
-        width = int(size.find('width').text)
-        height = int(size.find('height').text)
-        
-        # Process each object
-        for obj in root.findall('object'):
-            # Get class name
-            class_name = obj.find('name').text.lower()
-            
-            # Map VOC class to COCO class
-            if class_name in self.class_map:
-                coco_class_id = self.class_map[class_name]
-            else:
-                # Skip classes that don't map to a COCO class
-                continue
-            
-            # Skip ignored classes
-            if coco_class_id == -1:
-                continue
-            
-            # Get bounding box
-            bbox = obj.find('bndbox')
-            x1 = float(bbox.find('xmin').text)
-            y1 = float(bbox.find('ymin').text)
-            x2 = float(bbox.find('xmax').text)
-            y2 = float(bbox.find('ymax').text)
-            
-            # Skip invalid boxes
-            if x2 <= x1 or y2 <= y1:
-                continue
-            
-            boxes.append([x1, y1, x2, y2])
-            labels.append(coco_class_id)
-        
-        # Convert to tensors
-        boxes = torch.as_tensor(boxes, dtype=torch.float32)
-        labels = torch.as_tensor(labels, dtype=torch.int64)
-        
-        # Create target dictionary
-        target = {
-            'boxes': boxes,
-            'labels': labels,
-            'image_id': torch.tensor([int(img_id) if img_id.isdigit() else hash(img_id) % 10000]),
-            'area': (boxes[:, 2] - boxes[:, 0]) * (boxes[:, 3] - boxes[:, 1]) if len(boxes) > 0 else torch.tensor([]),
-            'iscrowd': torch.zeros((len(boxes),), dtype=torch.int64),
-            'orig_size': torch.as_tensor([height, width], dtype=torch.int64)
-        }
-        
-        # Apply transformations if provided
-        if self.transforms:
-            img, target = self.transforms(img, target)
-        else:
-            # Resize image to target size
-            img_pil = Image.fromarray(img)
-            img_pil = img_pil.resize(self.target_size[::-1])  # PIL uses (width, height)
-            img = np.array(img_pil)
-            
-            # Normalize pixel values to [0, 1]
-            img = img.astype(np.float32) / 255.0
-            
-            # Convert to tensor
-            img = torch.from_numpy(img).permute(2, 0, 1)  # (H, W, C) -> (C, H, W)
-            
-            # Scale boxes to new image size
-            if len(boxes) > 0:
-                h_ratio = self.target_size[0] / height
-                w_ratio = self.target_size[1] / width
-                
-                # Scale boxes
-                scaled_boxes = boxes.clone()
-                scaled_boxes[:, 0] *= w_ratio  # x1
-                scaled_boxes[:, 1] *= h_ratio  # y1
-                scaled_boxes[:, 2] *= w_ratio  # x2
-                scaled_boxes[:, 3] *= h_ratio  # y2
-                
-                target['boxes'] = scaled_boxes
-        
-        return {'img': img, 'target': target, 'image_id': img_id}
-    
-    def get_coco_gt(self):
-        """
-        Get COCO ground truth object for evaluation.
-        
-        Returns:
-            COCO object with ground truth annotations
-        """
-        if self.dataset_type == 'coco':
-            # For COCO dataset, return the loaded COCO object
-            return self.coco
-        else:
-            # For other datasets, convert to COCO format
-            return self.convert_to_coco_format()
-    
-    def convert_to_coco_format(self):
-        """
-        Convert dataset to COCO format for evaluation.
-        
-        Returns:
-            COCO object with ground truth annotations
-        """
-        # Create COCO structure
-        coco_dict = {
-            'images': [],
-            'annotations': [],
-            'categories': []
-        }
-        
-        # Add categories (COCO classes)
-        for coco_id, name in self.coco_names.items():
-            coco_dict['categories'].append({
-                'id': int(coco_id),
-                'name': name,
-                'supercategory': 'none'
-            })
-        
-        # Process each image in the dataset
-        annotation_id = 0
-        
-        for idx in range(len(self)):
-            # Get sample
-            sample = self[idx]
-            target = sample['target']
-            
-            # Get image ID
-            if isinstance(target['image_id'], torch.Tensor):
-                image_id = target['image_id'].item()
-            else:
-                image_id = target['image_id']
-            
-            # Get image size
-            if 'orig_size' in target:
-                if isinstance(target['orig_size'], torch.Tensor):
-                    img_h, img_w = target['orig_size'].tolist()
-                else:
-                    img_h, img_w = target['orig_size']
-            else:
-                # Default size
-                img_h, img_w = self.target_size
-            
-            # Add image entry
-            coco_dict['images'].append({
-                'id': int(image_id),
-                'width': int(img_w),
-                'height': int(img_h),
-                'file_name': f"{image_id}.jpg"  # Placeholder filename
-            })
-            
-            # Get boxes and labels
-            boxes = target['boxes']
-            labels = target['labels']
-            
-            # Convert boxes to COCO format and add annotations
-            for box_idx in range(len(boxes)):
-                if isinstance(boxes, torch.Tensor):
-                    x1, y1, x2, y2 = boxes[box_idx].tolist()
-                else:
-                    x1, y1, x2, y2 = boxes[box_idx]
-                
-                # COCO format uses [x, y, width, height]
-                coco_box = [
-                    float(x1),
-                    float(y1),
-                    float(x2 - x1),
-                    float(y2 - y1)
-                ]
-                
-                # Get label
-                if isinstance(labels, torch.Tensor):
-                    label = int(labels[box_idx].item())
-                else:
-                    label = int(labels[box_idx])
-                
-                # Get area if available, otherwise compute it
-                if 'area' in target and box_idx < len(target['area']):
-                    if isinstance(target['area'], torch.Tensor):
-                        area = float(target['area'][box_idx].item())
-                    else:
-                        area = float(target['area'][box_idx])
-                else:
-                    area = float((x2 - x1) * (y2 - y1))
-                
-                # Get iscrowd if available
-                if 'iscrowd' in target and box_idx < len(target['iscrowd']):
-                    if isinstance(target['iscrowd'], torch.Tensor):
-                        iscrowd = int(target['iscrowd'][box_idx].item())
-                    else:
-                        iscrowd = int(target['iscrowd'][box_idx])
-                else:
-                    iscrowd = 0
-                
-                # Add annotation
-                coco_dict['annotations'].append({
-                    'id': annotation_id,
-                    'image_id': int(image_id),
-                    'category_id': label,
-                    'bbox': coco_box,
-                    'area': area,
-                    'iscrowd': iscrowd,
-                    'segmentation': []  # No segmentation for detection
-                })
-                
-                annotation_id += 1
-        
-        # Create COCO object from dictionary
-        import tempfile
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.json') as f:
-            json.dump(coco_dict, f)
-            f.flush()
-            coco = COCO(f.name)
-        
-        return coco
-                
-def test_multiworld():
-    """
-    Test function for MultiWorld class.
-    """
-    # Initialize MultiWorld
-    yolo = MultiWorld(scale='s')
-    
-    # Load weights
-    yolo.load_weights("../modelzoo/yolov8s_statedicts.pt")
-    
-    # Test prediction on an image
-    image_path = "ModelDev/sampledata/bus.jpg"
-    results = yolo.predict(
-        image_path,
-        conf_thres=0.25,
-        visualize=True,
-        output_path="output/yoloworld_detection.jpg"
-    )
-    
-    # Print results
-    print(f"Detected {len(results['scores'])} objects:")
-    for i, (score, label) in enumerate(zip(results['scores'], results['labels'])):
-        class_name = yolo.class_names.get(label.item(), f"class_{label.item()}")
-        print(f"  {i+1}. {class_name}: {score.item():.4f}")
-    
-    # Display the image
-    cv2.imshow("MultiWorld Detection", results["visualization"])
-    cv2.waitKey(0)
-    cv2.destroyAllWindows()
 
 def test_rtdetr():
     import torch
@@ -2528,23 +2014,155 @@ def test_rtdetr():
             box = [round(i, 2) for i in box.tolist()]
             print(f"{model.config.id2label[label]}: {score:.2f} {box}")
             
-        
-def myevaluate_kitti():
-    # Initialize YOLOWorld
-    yolo_model = YOLOWorld(model="PekingU/rtdetr_v2_r18vd")
-    # Evaluate on KITTI dataset
-    results = yolo_model.evaluate_kitti(
-        kitti_dataset,
-        kitti_label_dir="/path/to/kitti/labels",
-        output_dir="./evaluation_results",
-        conf_thres=0.25
-    )
 
-    # Print results
-    print(f"AP: {results['AP']:.4f}")
-    print(f"AP50: {results['AP50']:.4f}")
-    print(f"AP75: {results['AP75']:.4f}")
+def test_multimodels():
+    """
+    Test function for MultiModels class demonstrating single image inference,
+    COCO dataset evaluation, and KITTI dataset evaluation.
+    """
+    import argparse
+    import os
     
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(description='Test MultiModels object detection')
+    parser.add_argument('--model', type=str, default='yolov8', help='Model type (yolov8, detr, rt-detr, rt-detrv2, vitdet)')
+    parser.add_argument('--weights', type=str, default="../modelzoo/yolov8s_statedicts.pt", help='Path to model weights')
+    parser.add_argument('--hub_model', type=str, default="lkk688/yolov8s-model", help='HF Hub model name (e.g., "facebook/detr-resnet-50")')
+    parser.add_argument('--image', type=str, default="ModelDev/sampledata/bus.jpg", help='Path to test image')
+    parser.add_argument('--conf', type=float, default=0.25, help='Confidence threshold')
+    parser.add_argument('--iou', type=float, default=0.45, help='IoU threshold for NMS')
+    parser.add_argument('--output_dir', type=str, default="output", help='Output directory')
+    parser.add_argument('--eval_coco', action='store_true', default=False, help='Evaluate on COCO dataset')
+    parser.add_argument('--coco_dir', type=str, default="", help='COCO dataset directory')
+    parser.add_argument('--eval_kitti', action='store_true', default=True, help='Evaluate on KITTI dataset')
+    parser.add_argument('--kitti_dir', type=str, default="/DATA10T/Datasets/Kitti/", help='KITTI dataset directory')
+    args = parser.parse_args()
+    
+    # Create output directory if it doesn't exist
+    os.makedirs(args.output_dir, exist_ok=True)
+    
+    # Initialize MultiModels
+    print(f"Initializing MultiModels with model type: {args.model}")
+    if args.hub_model:
+        # Load model from Hugging Face Hub
+        print(f"Loading model from Hugging Face Hub: {args.hub_model}")
+        yolo = MultiModels(model_name=args.hub_model)
+    else:
+        # Create model and load weights
+        yolo = MultiModels(model_type=args.model, scale='s')
+        if os.path.exists(args.weights):
+            print(f"Loading weights from: {args.weights}")
+            yolo.load_weights(args.weights)
+    
+    # Part 1: Single image inference
+    if os.path.exists(args.image):
+        print(f"\n--- Running inference on {args.image} ---")
+        output_path = os.path.join(args.output_dir, "detection_result.jpg")
+        
+        # Run prediction
+        results = yolo.predict(
+            args.image,
+            conf_thres=args.conf,
+            iou_thres=args.iou,
+            visualize=True,
+            output_path=output_path
+        )
+        
+        # Print results
+        if 'scores' in results and len(results['scores']) > 0:
+            print(f"Detected {len(results['scores'])} objects:")
+            for i, (score, label, box) in enumerate(zip(
+                results['scores'], results['labels'], results['boxes']
+            )):
+                class_name = yolo.class_names.get(label.item(), f"class_{label.item()}")
+                print(f"  {i+1}. {class_name}: {score.item():.4f} at {box.tolist()}")
+            
+            print(f"Visualization saved to: {output_path}")
+            
+            # Display the image if available
+            if 'visualization' in results and not (args.eval_coco or args.eval_kitti):
+                cv2.imshow("MultiModels Detection", results["visualization"])
+                cv2.waitKey(0)
+                cv2.destroyAllWindows()
+        else:
+            print("No objects detected.")
+    
+    # Part 2: COCO evaluation
+    if args.eval_coco:
+        if not args.coco_dir:
+            print("\nSkipping COCO evaluation: No dataset directory provided.")
+            print("Use --coco_dir to specify the COCO dataset directory.")
+        else:
+            print(f"\n--- Running COCO evaluation ---")
+            
+            # Create COCO validation dataset
+            val_dataset = DetectionDataset(
+                dataset_type='coco',
+                data_dir=args.coco_dir,
+                split='val',
+                target_size=(640, 640)
+            )
+            
+            # Run evaluation
+            eval_results = yolo.evaluate_coco(
+                dataset=val_dataset,
+                output_dir=args.output_dir,
+                batch_size=4,  # Adjust based on available memory
+                conf_thres=args.conf,
+                iou_thres=args.iou
+            )
+            
+            # Print evaluation results
+            print("\nCOCO Evaluation Results:")
+            if isinstance(eval_results, dict):
+                for metric, value in eval_results.items():
+                    print(f"  {metric}: {value:.4f}")
+            else:
+                print("  No valid evaluation results returned.")
+    
+    # Part 3: KITTI evaluation
+    if args.eval_kitti:
+        if not args.kitti_dir:
+            print("\nSkipping KITTI evaluation: No dataset directory provided.")
+            print("Use --kitti_dir to specify the KITTI dataset directory.")
+        else:
+            print(f"\n--- Running KITTI evaluation ---")
+            
+            # Create KITTI validation dataset
+            kitti_dataset = DetectionDataset(
+                dataset_type='kitti',
+                data_dir=args.kitti_dir,
+                split='val',
+                target_size=(640, 640)
+            )
+            
+            # Run evaluation
+            kitti_results = yolo.evaluate_kitti(
+                dataset=kitti_dataset,
+                output_dir=os.path.join(args.output_dir, "kitti_eval"),
+                batch_size=4,  # Adjust based on available memory
+                conf_thres=args.conf,
+                iou_thres=args.iou
+            )
+            
+            # Print evaluation results
+            print("\nKITTI Evaluation Results:")
+            if isinstance(kitti_results, dict):
+                for metric, value in kitti_results.items():
+                    if isinstance(value, float):
+                        print(f"  {metric}: {value:.4f}")
+                    else:
+                        print(f"  {metric}: {value}")
+                        
+                # Print per-class results if available
+                if 'per_class' in kitti_results:
+                    print("\nPer-class Results:")
+                    for class_name, metrics in kitti_results['per_class'].items():
+                        print(f"  {class_name}:")
+                        for metric, value in metrics.items():
+                            print(f"    {metric}: {value:.4f}")
+            else:
+                print("  No valid evaluation results returned.")
+
 if __name__ == "__main__":
-    #myevaluate_kitti()
-    test_rtdetr()
+    test_multimodels()

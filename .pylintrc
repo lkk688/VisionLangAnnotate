@@ -1,0 +1,14 @@
+[MESSAGES CONTROL]
+disable =
+    C0114,  # Missing module docstring
+    C0115,  # Missing class docstring
+    C0116,  # Missing function docstring
+    W0613,  # Unused argument
+    R0903,  # Too few public methods (for classes like dataclasses)
+    C0301,  # Line too long
+    W0703,  # Broad exception catch
+    E1101,  # Module member not found (common with dynamic imports)
+    R0913,  # Too many arguments
+    R0914,  # Too many local variables
+    C0103,  # Variable name doesn't conform to snake_case
+    W0622,  # Redefining built-in names (e.g., `id`, `list`)
