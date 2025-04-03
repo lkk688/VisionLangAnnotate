@@ -11,7 +11,7 @@ from PIL import Image
 
 from modeling_yolohf import register_yolo_architecture, YoloConfig          
 from transformers import AutoModelForObjectDetection
-from multidatasets import coco_names, DetectionDataset
+from multidatasets import coco_names, kitti_to_coco, DetectionDataset
 
 class MultiModels:
     """
@@ -506,7 +506,7 @@ class MultiModels:
     
     def _run_inference_on_dataset(self, dataset, batch_size=16, conf_thres=0.25, 
                                  iou_thres=0.45, max_det=300, output_dir=None,
-                                 output_format='coco'):
+                                 output_format='coco', visualize=True):
         """
         Run inference on a dataset and return detections in specified format.
         
@@ -538,6 +538,9 @@ class MultiModels:
         # Initialize results
         results = []
         
+        # Store image ID mapping for consistent IDs between GT and detections
+        self.image_id_map = {}
+        
         # Progress bar
         pbar = tqdm(dataloader, desc=f"Running inference for {output_format.upper()} evaluation")
         
@@ -547,7 +550,19 @@ class MultiModels:
                 if isinstance(batch, dict):
                     # Dictionary format
                     batch_images = batch.get('img', batch.get('pixel_values', batch.get('images')))
+                    
+                    # Store original images for visualization if not already present
+                    if visualize and 'img_orig' not in batch and isinstance(batch_images, torch.Tensor):
+                        # Convert tensor back to numpy for visualization
+                        if batch_images.dim() == 4:  # batch of images
+                            batch['img_orig'] = [img.permute(1, 2, 0).cpu().numpy() for img in batch_images]
+                        elif batch_images.dim() == 3:  # single image
+                            batch['img_orig'] = [batch_images.permute(1, 2, 0).cpu().numpy()]
+                            
                     if isinstance(batch_images, list):
+                         # Store original images before processing
+                        if visualize and 'img_orig' not in batch:
+                            batch['img_orig'] = batch_images.copy()
                         # Process images with processor if they're not tensors
                         inputs = self.processor(images=batch_images, return_tensors="pt")
                         batch_images = inputs["pixel_values"]
@@ -557,13 +572,16 @@ class MultiModels:
                     if isinstance(batch[1], dict):
                         batch = batch[1]
                         batch['img'] = batch_images
+                        
+                        # Store original images for visualization
+                        if visualize and 'img_orig' not in batch and isinstance(batch_images, torch.Tensor):
+                            if batch_images.dim() == 4:  # batch of images
+                                batch['img_orig'] = [img.permute(1, 2, 0).cpu().numpy() for img in batch_images]
+                            elif batch_images.dim() == 3:  # single image
+                                batch['img_orig'] = [batch_images.permute(1, 2, 0).cpu().numpy()]
                 else:
                     print(f"Warning: Unsupported batch format: {type(batch)}")
                     continue
-                
-                # Move batch to device
-                if isinstance(batch_images, torch.Tensor):
-                    batch_images = batch_images.to(self.device)
                 
                 # Get image metadata if available
                 if isinstance(batch, dict) and 'image_id' in batch:
@@ -577,6 +595,23 @@ class MultiModels:
                         batch_idx * batch_size, 
                         min((batch_idx + 1) * batch_size, len(dataset))
                     ))
+                
+                # Move batch to device
+                if isinstance(batch_images, torch.Tensor):
+                    batch_images = batch_images.to(self.device) #[4, 3, 640, 640]
+                
+                # Get image metadata if available
+                if isinstance(batch, dict) and 'image_id' in batch:
+                    batch_image_ids = batch['image_id']
+                elif isinstance(batch, dict) and 'img_path' in batch:
+                    # Extract image IDs from file paths
+                    batch_image_ids = [os.path.splitext(os.path.basename(path))[0] for path in batch['img_path']]
+                else:
+                    # Generate sequential IDs if not provided
+                    batch_image_ids = list(range(
+                        batch_idx * batch_size, 
+                        min((batch_idx + 1) * batch_size, len(dataset))
+                    )) #[0, 1, 2, 3]
                 
                 # Run inference based on model type
                 try:
@@ -643,6 +678,15 @@ class MultiModels:
                     if isinstance(pred_labels, torch.Tensor):
                         pred_labels = pred_labels.cpu().numpy()
                     
+                    # Store consistent image ID mapping
+                    if isinstance(img_id, str):
+                        # Convert string IDs to integers for COCO
+                        if img_id not in self.image_id_map:
+                            self.image_id_map[img_id] = len(self.image_id_map)
+                        numeric_img_id = self.image_id_map[img_id]
+                    else:
+                        numeric_img_id = int(img_id)
+                        
                     # Process detections based on output format
                     if output_format == 'coco':
                         # Convert each detection to COCO format
@@ -670,8 +714,17 @@ class MultiModels:
                                 category_id = int(label)
                             
                             # Create detection entry
+                            # detection = {
+                            #     'image_id': int(img_id) if not isinstance(img_id, str) else hash(img_id) % 10000,
+                            #     'category_id': category_id,
+                            #     'bbox': coco_box,
+                            #     'score': float(pred_scores[box_idx]),
+                            #     'area': float((x2 - x1) * (y2 - y1)),
+                            #     'iscrowd': 0
+                            # }
+                            # Create detection entry with consistent image ID
                             detection = {
-                                'image_id': int(img_id) if not isinstance(img_id, str) else hash(img_id) % 10000,
+                                'image_id': numeric_img_id,
                                 'category_id': category_id,
                                 'bbox': coco_box,
                                 'score': float(pred_scores[box_idx]),
@@ -722,23 +775,45 @@ class MultiModels:
                             image_results.append(kitti_line)
                         
                         # Add to results
+                        # results.append({
+                        #     'image_id': img_id,
+                        #     'detections': image_results
+                        # })
+                        
+                        # Add to results with consistent image ID
                         results.append({
-                            'image_id': img_id,
+                            'image_id': numeric_img_id,
+                            'original_id': img_id,  # Keep original ID for file naming
                             'detections': image_results
                         })
                         
                         # Save detections to file if output directory is provided
                         if output_dir:
+                            # Use original ID for file naming
                             result_file = os.path.join(output_dir, f"{img_id}.txt")
                             with open(result_file, 'w') as f:
                                 for line in image_results:
                                     f.write(line + '\n')
                     
                     # Visualize if output directory is provided
-                    if output_dir and batch_idx % 10 == 0 and i == 0:  # Visualize every 10th batch, first image
+                    if visualize and output_dir and batch_idx % 10 == 0 and i == 0:  # Visualize every 10th batch, first image
                         # Try to get original image for visualization
                         if isinstance(batch, dict) and 'img_orig' in batch:
-                            img_orig = batch['img_orig'][i]
+                            #img_orig = batch['img_orig'][i]
+                            img_orig = batch['img_orig'][i] if isinstance(batch['img_orig'], list) else batch['img_orig']
+                            
+                            # Convert tensor to numpy if needed
+                            if isinstance(img_orig, torch.Tensor):
+                                img_orig = img_orig.permute(1, 2, 0).cpu().numpy()
+                                
+                            # Convert normalized image to uint8 if needed
+                            if img_orig.dtype == np.float32 and img_orig.max() <= 1.0:
+                                img_orig = (img_orig * 255).astype(np.uint8)
+                                
+                            # Convert RGB to BGR for OpenCV if needed
+                            if img_orig.shape[2] == 3:  # RGB image
+                                img_orig = cv2.cvtColor(img_orig, cv2.COLOR_RGB2BGR)
+                                
                         elif isinstance(batch, dict) and 'img_path' in batch:
                             try:
                                 img_path = batch['img_path'][i] if isinstance(batch['img_path'], list) else batch['img_path']
@@ -746,7 +821,17 @@ class MultiModels:
                             except:
                                 img_orig = None
                         else:
-                            img_orig = None
+                            # Try to reconstruct from processed tensor
+                            try:
+                                if isinstance(batch_images, torch.Tensor) and batch_images.dim() == 4:
+                                    img = batch_images[i].permute(1, 2, 0).cpu().numpy()
+                                    img_orig = (img * 255).astype(np.uint8)
+                                    if img_orig.shape[2] == 3:  # RGB image
+                                        img_orig = cv2.cvtColor(img_orig, cv2.COLOR_RGB2BGR)
+                                else:
+                                    img_orig = None
+                            except:
+                                img_orig = None
                         
                         if img_orig is not None:
                             # Create visualization
@@ -790,6 +875,10 @@ class MultiModels:
                 'supercategory': 'none'
             })
         
+        # Create image ID mapping if it doesn't exist
+        if not hasattr(self, 'image_id_map'):
+            self.image_id_map = {}
+        
         # Process each image in the dataset
         annotation_id = 0
         for idx in range(len(dataset)):
@@ -799,8 +888,18 @@ class MultiModels:
             # Get image ID
             if hasattr(sample, 'image_id'):
                 image_id = sample.image_id
+            elif isinstance(sample, dict) and 'image_id' in sample:
+                image_id = sample['image_id']
             else:
                 image_id = idx
+            
+            # Ensure consistent image ID mapping
+            if isinstance(image_id, str):
+                if image_id not in self.image_id_map:
+                    self.image_id_map[image_id] = len(self.image_id_map)
+                numeric_image_id = self.image_id_map[image_id]
+            else:
+                numeric_image_id = int(image_id)
             
             # Get image size
             if hasattr(sample, 'orig_size'):
@@ -822,7 +921,7 @@ class MultiModels:
                 'id': int(image_id),
                 'width': int(img_w),
                 'height': int(img_h),
-                'file_name': f"{image_id}.jpg"  # Placeholder filename
+                'file_name': f"{image_id}.jpg"  # Keep original ID for filename
             })
             
             # Get ground truth boxes and labels
@@ -882,9 +981,19 @@ class MultiModels:
                     iscrowd = 0
                 
                 # Add annotation
+                # coco_dict['annotations'].append({
+                #     'id': annotation_id,
+                #     'image_id': int(image_id),
+                #     'category_id': label,
+                #     'bbox': coco_box,
+                #     'area': area,
+                #     'iscrowd': iscrowd,
+                #     'segmentation': []  # No segmentation for detection
+                # })
+                # Add annotation with consistent image ID
                 coco_dict['annotations'].append({
                     'id': annotation_id,
-                    'image_id': int(image_id),
+                    'image_id': numeric_image_id,
                     'category_id': label,
                     'bbox': coco_box,
                     'area': area,
@@ -915,12 +1024,57 @@ class MultiModels:
         Returns:
             Dictionary with evaluation metrics
         """
+        # Check if there are any results
+        if not coco_results:
+            print("Warning: No detection results to evaluate")
+            return {
+                'AP': 0, 'AP50': 0, 'AP75': 0,
+                'APs': 0, 'APm': 0, 'APl': 0,
+                'ARmax1': 0, 'ARmax10': 0, 'ARmax100': 0,
+                'ARs': 0, 'ARm': 0, 'ARl': 0
+            }
+        
+        # Verify that all image IDs in results exist in ground truth
+        gt_img_ids = set(coco_gt.getImgIds())
+        result_img_ids = set(r['image_id'] for r in coco_results)
+        
+        # Filter out results with image IDs not in ground truth
+        valid_results = [r for r in coco_results if r['image_id'] in gt_img_ids]
+        
+        if len(valid_results) < len(coco_results):
+            print(f"Warning: Filtered out {len(coco_results) - len(valid_results)} results with invalid image IDs")
+            
+        if not valid_results:
+            print("Error: No valid detection results to evaluate after filtering")
+            return {
+                'AP': 0, 'AP50': 0, 'AP75': 0,
+                'APs': 0, 'APm': 0, 'APl': 0,
+                'ARmax1': 0, 'ARmax10': 0, 'ARmax100': 0,
+                'ARs': 0, 'ARm': 0, 'ARl': 0
+            }
+        
         # Create COCO detection object
         import tempfile
         with tempfile.NamedTemporaryFile(mode='w', suffix='.json') as f:
-            json.dump(coco_results, f)
+            json.dump(valid_results, f)
             f.flush()
-            coco_dt = coco_gt.loadRes(f.name)
+            try:
+                coco_dt = coco_gt.loadRes(f.name)
+            except Exception as e:
+                print(f"Error loading results: {e}")
+                # Try to debug the issue
+                print(f"Ground truth has {len(gt_img_ids)} images")
+                print(f"Results contain {len(result_img_ids)} unique image IDs")
+                print(f"First few ground truth image IDs: {list(gt_img_ids)[:5]}")
+                print(f"First few result image IDs: {list(result_img_ids)[:5]}")
+                
+                # Return empty metrics
+                return {
+                    'AP': 0, 'AP50': 0, 'AP75': 0,
+                    'APs': 0, 'APm': 0, 'APl': 0,
+                    'ARmax1': 0, 'ARmax10': 0, 'ARmax100': 0,
+                    'ARs': 0, 'ARm': 0, 'ARl': 0
+                }
         
         # Create COCO evaluator
         coco_eval = COCOeval(coco_gt, coco_dt, 'bbox')
@@ -1156,7 +1310,150 @@ class MultiModels:
         
         return coco_gt
     
-    def evaluate_kitti(self, kitti_dataset, kitti_label_dir=None, output_dir=None, 
+    def evaluate_kitti(self, dataset, output_dir=None, batch_size=16, conf_thres=0.25, 
+                       iou_thres=0.45, max_det=300, kitti_label_dir=None):
+        """
+        Evaluate the model on KITTI dataset using COCO metrics.
+        
+        Args:
+            dataset: KITTI dataset object
+            output_dir: Directory to save evaluation results
+            batch_size: Batch size for inference
+            conf_thres: Confidence threshold for detections
+            iou_thres: IoU threshold for NMS
+            max_det: Maximum number of detections per image
+            kitti_label_dir: Directory containing KITTI labels (if not in dataset)
+            
+        Returns:
+            Dictionary with evaluation metrics
+        """
+        # Create output directory if provided
+        if output_dir:
+            os.makedirs(output_dir, exist_ok=True)
+        
+        # First, convert KITTI dataset to COCO format for ground truth
+        # This will establish our image ID mapping
+        coco_gt = self.convert_kitti_to_coco(dataset, kitti_label_dir)
+        
+        # Get the valid image IDs from ground truth
+        gt_img_ids = set(coco_gt.getImgIds())
+        
+        # Create a mapping from original image IDs to COCO image IDs
+        # This is crucial for matching detection results with ground truth
+        img_id_mapping = {}
+        for img_id in gt_img_ids:
+            img_info = coco_gt.loadImgs(img_id)[0]
+            original_id = os.path.splitext(img_info['file_name'])[0]
+            img_id_mapping[original_id] = img_id
+        
+        # Store original image paths or IDs for later matching
+        original_img_ids = []
+        for idx in range(len(dataset)):
+            # Get sample
+            if hasattr(dataset, '__getitem__'):
+                sample = dataset[idx]
+            else:
+                continue
+                
+            # Get image path or ID
+            if hasattr(sample, 'img_path'):
+                img_path = sample.img_path
+            elif 'img_path' in sample:
+                img_path = sample['img_path']
+            elif hasattr(dataset, 'image_paths') and idx < len(dataset.image_paths):
+                img_path = dataset.image_paths[idx]
+            else:
+                # Use index as fallback
+                img_path = f"{idx}.png"
+                
+            # Extract original ID from path
+            original_id = os.path.splitext(os.path.basename(img_path))[0]
+            original_img_ids.append(original_id)
+            
+        # Run inference on dataset and get detections in KITTI format
+        kitti_results = self._run_inference_on_dataset(
+            dataset=dataset,
+            batch_size=batch_size,
+            conf_thres=conf_thres,
+            iou_thres=iou_thres,
+            max_det=max_det,
+            output_dir=output_dir,
+            output_format='kitti'
+        )
+        
+        # Convert KITTI dataset to COCO format for ground truth
+        #coco_gt = self.convert_kitti_to_coco(dataset, kitti_label_dir)
+        
+        # Convert KITTI detections to COCO format for evaluation
+        coco_detections = []
+        
+        print(f"Got {len(kitti_results)} detection results from inference")
+        print(f"Original image IDs: {original_img_ids[:5]}... (total: {len(original_img_ids)})")
+        
+        # Match results with original image IDs
+        for i, result in enumerate(kitti_results):
+            # Get the original image ID using the index
+            if i < len(original_img_ids):
+                original_id = original_img_ids[i]
+            else:
+                # Skip if index is out of range
+                print(f"Warning: Result index {i} is out of range for original_img_ids")
+                continue
+            
+            # Map to the correct COCO image ID using our mapping
+            if original_id in img_id_mapping:
+                coco_img_id = img_id_mapping[original_id]
+            else:
+                # Skip if we can't find a mapping
+                print(f"Warning: Could not find mapping for image ID: {original_id}")
+                continue
+            
+            # Parse KITTI format detections
+            for detection in result['detections']:
+                parts = detection.strip().split()
+                if len(parts) < 15:  # KITTI format should have at least 15 parts
+                    continue
+                
+                obj_type = parts[0]
+                x1, y1, x2, y2 = map(float, parts[4:8])
+                score = float(parts[14])
+                
+                category_id = kitti_to_coco.get(obj_type, 90)
+                
+                # Skip DontCare
+                if category_id == 91:
+                    continue
+                
+                # Create COCO detection entry with consistent image ID
+                coco_detections.append({
+                    'image_id': coco_img_id,
+                    'category_id': category_id,
+                    'bbox': [float(x1), float(y1), float(x2-x1), float(y2-y1)],
+                    'score': score,
+                    'area': float((x2-x1) * (y2-y1)),
+                    'iscrowd': 0
+                })
+        
+        # Print debug info
+        print(f"Ground truth has {len(gt_img_ids)} images")
+        print(f"Converted {len(coco_detections)} detections for evaluation")
+        
+        # Additional debug info
+        if len(coco_detections) == 0:
+            print("No valid detections found. Checking detection results:")
+            for i, result in enumerate(kitti_results[:5]):  # Print first 5 for debugging
+                print(f"Result {i}:")
+                print(f"  Image ID: {result.get('original_id', str(result['image_id']))}")
+                print(f"  Number of detections: {len(result['detections'])}")
+                if len(result['detections']) > 0:
+                    print(f"  First detection: {result['detections'][0]}")
+                    
+        # Run COCO evaluation
+        results = self._run_coco_evaluation(coco_gt, coco_detections, output_dir)
+        
+        return results
+        
+    def evaluate_kitti_old(self, kitti_dataset, kitti_label_dir=None, output_dir=None, 
                        batch_size=16, conf_thres=0.25, iou_thres=0.45, max_det=300):
         """
         Evaluate the model on KITTI dataset using COCO metrics.
@@ -1390,9 +1687,23 @@ class MultiModels:
         img_vis = image.copy()
         
         # Extract detection components
-        boxes = detections["boxes"].cpu().numpy()
-        scores = detections["scores"].cpu().numpy()
-        labels = detections["labels"].cpu().numpy()
+        # Check if boxes is a tensor or numpy array
+        if isinstance(detections["boxes"], torch.Tensor):
+            boxes = detections["boxes"].cpu().numpy()
+        else:
+            boxes = detections["boxes"]
+            
+        # Check if scores is a tensor or numpy array
+        if isinstance(detections["scores"], torch.Tensor):
+            scores = detections["scores"].cpu().numpy()
+        else:
+            scores = detections["scores"]
+            
+        # Check if labels is a tensor or numpy array
+        if isinstance(detections["labels"], torch.Tensor):
+            labels = detections["labels"].cpu().numpy()
+        else:
+            labels = detections["labels"]
         
         # Draw boxes on the image
         for i, box in enumerate(boxes):
@@ -1739,7 +2050,7 @@ class MultiModels:
         
         return avg_loss
     
-        def _validate(self, dataloader, epoch):
+    def _validate(self, dataloader, epoch):
         """
         Validate the model on a dataset.
         
@@ -2079,11 +2390,6 @@ def test_multimodels():
             
             print(f"Visualization saved to: {output_path}")
             
-            # Display the image if available
-            if 'visualization' in results and not (args.eval_coco or args.eval_kitti):
-                cv2.imshow("MultiModels Detection", results["visualization"])
-                cv2.waitKey(0)
-                cv2.destroyAllWindows()
         else:
             print("No objects detected.")
     

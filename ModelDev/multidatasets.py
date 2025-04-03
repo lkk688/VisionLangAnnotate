@@ -33,6 +33,19 @@ coco_names = {
     76: 'scissors', 77: 'teddy bear', 78: 'hair drier', 79: 'toothbrush'
 }
 
+# Map KITTI class to COCO class
+kitti_to_coco = {
+    'Car': 2,
+    'Van': 2,
+    'Truck': 7,
+    'Pedestrian': 0,
+    'Person_sitting': 0,
+    'Cyclist': 1,
+    'Tram': 6,
+    'Misc': 90,
+    'DontCare': 91
+}
+
 class DetectionDataset(Dataset):
     """
     Universal detection dataset class that supports COCO, KITTI, and other formats.
@@ -45,7 +58,7 @@ class DetectionDataset(Dataset):
                  image_dir=None,
                  split='train',
                  transforms=None,
-                 preprocess=False,
+                 preprocess=True,
                  target_size=(640, 640),
                  cache_images=False,
                  class_map=None,
