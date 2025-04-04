@@ -92,15 +92,19 @@ class DetectionDataset(Dataset):
         self.class_map = class_map or self._get_default_class_map(dataset_type)     
         # Initialize COCO class names (standard 80 classes)
         self.coco_names = coco_names
-        # Load dataset based on type
-        self._load_dataset()
-        # Cache for images
-        self.img_cache = {} if cache_images else None
+        
         # Initialize COCO attribute in __init__
         self._coco = None
         self.image_ids = []
+        self.image_paths = []
         # Create category ID to COCO class ID mapping
         self.cat_id_to_coco_id = {}
+        
+        # Load dataset based on type
+        self._load_dataset()
+        
+        # Cache for images
+        self.img_cache = {} if cache_images else None
         
         
     def _get_default_class_map(self, dataset_type):
@@ -644,6 +648,10 @@ class DetectionDataset(Dataset):
         Returns:
             Dictionary with image and target
         """
+        # Check if image_ids is empty
+        if not self.image_ids:
+            raise ValueError("No images found in the dataset. Check if _load_coco_dataset was called successfully.")
+        
         # Get image ID
         img_id = self.image_ids[idx]
         
@@ -654,6 +662,20 @@ class DetectionDataset(Dataset):
             # Load image
             img_info = self._coco.loadImgs(img_id)[0]
             img_path = os.path.join(str(self.image_dir), str(img_info['file_name']))
+            if not os.path.exists(img_path):
+                print(f"Warning: Image file not found: {img_path}")
+                # Return a dummy image and empty target
+                img = np.zeros((self.target_size[0], self.target_size[1], 3), dtype=np.uint8)
+                target = {
+                    'boxes': torch.zeros((0, 4), dtype=torch.float32),
+                    'labels': torch.zeros((0,), dtype=torch.int64),
+                    'image_id': torch.tensor([img_id]),
+                    'area': torch.zeros((0,), dtype=torch.float32),
+                    'iscrowd': torch.zeros((0,), dtype=torch.int64),
+                    'orig_size': torch.as_tensor([self.target_size[0], self.target_size[1]], dtype=torch.int64)
+                }
+                return {'img': torch.from_numpy(img.transpose(2, 0, 1)).float() / 255.0, 'target': target, 'image_id': img_id}
+            
             img = cv2.imread(img_path)
             img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
             

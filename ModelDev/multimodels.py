@@ -489,15 +489,48 @@ class MultiModels:
             print(f"Saved detections to {detections_file}")
         
         # Get or create ground truth COCO annotations
-        if hasattr(dataset, 'coco_gt'):
+        if hasattr(dataset, '_coco') and dataset._coco is not None:
             # Dataset already has COCO ground truth
+            print("Using dataset's existing COCO ground truth")
+            coco_gt = dataset._coco
+        elif hasattr(dataset, 'coco_gt') and dataset.coco_gt is not None:
+            # Dataset already has COCO ground truth
+            print("Using dataset's existing COCO ground truth")
             coco_gt = dataset.coco_gt
         elif convert_format:
             # Use provided conversion function
+            print("Using provided conversion function")
             coco_gt = convert_format(dataset)
         else:
             # Try to convert dataset to COCO format
+            print("Converting dataset to COCO format")
             coco_gt = self._convert_dataset_to_coco(dataset)
+        
+        # Debug: Print information about ground truth and results
+        gt_img_ids = set(coco_gt.getImgIds())
+        result_img_ids = set(r['image_id'] for r in coco_results)
+        
+        print(f"Ground truth has {len(gt_img_ids)} images")
+        print(f"Results contain {len(result_img_ids)} unique image IDs")
+        print(f"Overlap: {len(gt_img_ids.intersection(result_img_ids))} images")
+        
+        # Check if there are any categories in the ground truth
+        gt_cat_ids = set(coco_gt.getCatIds())
+        result_cat_ids = set(r['category_id'] for r in coco_results)
+        
+        print(f"Ground truth has {len(gt_cat_ids)} categories: {list(gt_cat_ids)[:10]}")
+        print(f"Results contain {len(result_cat_ids)} unique category IDs: {list(result_cat_ids)[:10]}")
+        
+        # Save ground truth to file for debugging
+        if output_dir:
+            gt_file = os.path.join(output_dir, "coco_ground_truth.json")
+            with open(gt_file, 'w') as f:
+                json.dump({
+                    'images': coco_gt.dataset.get('images', []),
+                    'annotations': coco_gt.dataset.get('annotations', []),
+                    'categories': coco_gt.dataset.get('categories', [])
+                }, f)
+            print(f"Saved ground truth to {gt_file}")
         
         # Run COCO evaluation
         results = self._run_coco_evaluation(coco_gt, coco_results, output_dir)
@@ -525,15 +558,15 @@ class MultiModels:
         # Set model to evaluation mode
         self.model.eval()
         
-        # Create data loader
+        #num_workers = min(4, os.cpu_count() or 1)
         dataloader = torch.utils.data.DataLoader(
-            dataset, 
-            batch_size=batch_size,
-            shuffle=False,
-            num_workers=min(8, os.cpu_count() or 1),
-            pin_memory=True,
-            collate_fn=getattr(dataset, 'collate_fn', self._collate_fn)
-        )
+                dataset, 
+                batch_size=batch_size,
+                shuffle=False,
+                num_workers=0,  # No multiprocessing
+                pin_memory=False,
+                collate_fn=getattr(dataset, 'collate_fn', self._collate_fn)
+            )
         
         # Initialize results
         results = []
@@ -2337,14 +2370,14 @@ def test_multimodels():
     # Parse command line arguments
     parser = argparse.ArgumentParser(description='Test MultiModels object detection')
     parser.add_argument('--model', type=str, default='yolov8', help='Model type (yolov8, detr, rt-detr, rt-detrv2, vitdet)')
-    parser.add_argument('--weights', type=str, default="../modelzoo/yolov8s_statedicts.pt", help='Path to model weights')
-    parser.add_argument('--hub_model', type=str, default="lkk688/yolov8s-model", help='HF Hub model name (e.g., "facebook/detr-resnet-50")')
-    parser.add_argument('--image', type=str, default="ModelDev/sampledata/bus.jpg", help='Path to test image')
+    parser.add_argument('--weights', type=str, default="", help='Path to model weights: ../modelzoo/yolov8s_statedicts.pt')
+    parser.add_argument('--hub_model', type=str, default="lkk688/yolov8x-model", help='HF Hub model name (e.g., "facebook/detr-resnet-50")')
+    parser.add_argument('--image', type=str, default="ModelDev/sampledata/sjsupeople.jpg", help='Path to test image')
     parser.add_argument('--conf', type=float, default=0.25, help='Confidence threshold')
     parser.add_argument('--iou', type=float, default=0.45, help='IoU threshold for NMS')
     parser.add_argument('--output_dir', type=str, default="output", help='Output directory')
-    parser.add_argument('--eval_coco', action='store_true', default=False, help='Evaluate on COCO dataset')
-    parser.add_argument('--coco_dir', type=str, default="", help='COCO dataset directory')
+    parser.add_argument('--eval_coco', action='store_true', default=True, help='Evaluate on COCO dataset')
+    parser.add_argument('--coco_dir', type=str, default="/DATA10T/Datasets/COCOoriginal", help='COCO dataset directory')
     parser.add_argument('--eval_kitti', action='store_true', default=True, help='Evaluate on KITTI dataset')
     parser.add_argument('--kitti_dir', type=str, default="/DATA10T/Datasets/Kitti/", help='KITTI dataset directory')
     args = parser.parse_args()
