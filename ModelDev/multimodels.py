@@ -582,7 +582,7 @@ class MultiModels:
                 # Handle different batch formats
                 if isinstance(batch, dict):
                     # Dictionary format
-                    batch_images = batch.get('img', batch.get('pixel_values', batch.get('images')))
+                    batch_images = batch.get('img', batch.get('pixel_values', batch.get('images'))) #[4, 3, 640, 640]
                     
                     # Store original images for visualization if not already present
                     if visualize and 'img_orig' not in batch and isinstance(batch_images, torch.Tensor):
@@ -617,34 +617,35 @@ class MultiModels:
                     continue
                 
                 # Get image metadata if available
-                if isinstance(batch, dict) and 'image_id' in batch:
-                    batch_image_ids = batch['image_id']
-                elif isinstance(batch, dict) and 'img_path' in batch:
-                    # Extract image IDs from file paths
-                    batch_image_ids = [os.path.splitext(os.path.basename(path))[0] for path in batch['img_path']]
-                else:
-                    # Generate sequential IDs if not provided
-                    batch_image_ids = list(range(
-                        batch_idx * batch_size, 
-                        min((batch_idx + 1) * batch_size, len(dataset))
-                    ))
+                batch_image_ids = [target['image_id'] for target in batch['target']]
+                # if isinstance(batch, dict) and 'image_id' in batch:
+                #     batch_image_ids = batch['image_id']
+                # elif isinstance(batch, dict) and 'img_path' in batch:
+                #     # Extract image IDs from file paths
+                #     batch_image_ids = [os.path.splitext(os.path.basename(path))[0] for path in batch['img_path']]
+                # else:
+                #     # Generate sequential IDs if not provided
+                #     batch_image_ids = list(range(
+                #         batch_idx * batch_size, 
+                #         min((batch_idx + 1) * batch_size, len(dataset))
+                #     ))
                 
                 # Move batch to device
                 if isinstance(batch_images, torch.Tensor):
                     batch_images = batch_images.to(self.device) #[4, 3, 640, 640]
                 
-                # Get image metadata if available
-                if isinstance(batch, dict) and 'image_id' in batch:
-                    batch_image_ids = batch['image_id']
-                elif isinstance(batch, dict) and 'img_path' in batch:
-                    # Extract image IDs from file paths
-                    batch_image_ids = [os.path.splitext(os.path.basename(path))[0] for path in batch['img_path']]
-                else:
-                    # Generate sequential IDs if not provided
-                    batch_image_ids = list(range(
-                        batch_idx * batch_size, 
-                        min((batch_idx + 1) * batch_size, len(dataset))
-                    )) #[0, 1, 2, 3]
+                # # Get image metadata if available
+                # if isinstance(batch, dict) and 'image_id' in batch:
+                #     batch_image_ids = batch['image_id']
+                # elif isinstance(batch, dict) and 'img_path' in batch:
+                #     # Extract image IDs from file paths
+                #     batch_image_ids = [os.path.splitext(os.path.basename(path))[0] for path in batch['img_path']]
+                # else:
+                #     # Generate sequential IDs if not provided
+                #     batch_image_ids = list(range(
+                #         batch_idx * batch_size, 
+                #         min((batch_idx + 1) * batch_size, len(dataset))
+                #     )) #[0, 1, 2, 3]
                 
                 # Run inference based on model type
                 try:
