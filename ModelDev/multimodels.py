@@ -617,7 +617,7 @@ class MultiModels:
                     continue
                 
                 # Get image metadata if available
-                batch_image_ids = [target['image_id'] for target in batch['target']]
+                batch_image_ids = [target['image_id'][0].numpy() for target in batch['target']]
                 # if isinstance(batch, dict) and 'image_id' in batch:
                 #     batch_image_ids = batch['image_id']
                 # elif isinstance(batch, dict) and 'img_path' in batch:
@@ -652,7 +652,7 @@ class MultiModels:
                     if self.model_type == 'yolov8':
                         # YOLO models expect pixel_values and have postprocess parameter
                         outputs = self.model(
-                            pixel_values=batch_images,
+                            pixel_values=batch_images, #[4, 3, 640, 640]
                             postprocess=True,
                             conf_thres=conf_thres,
                             iou_thres=iou_thres,
@@ -684,13 +684,13 @@ class MultiModels:
                 
                 # Process each image in the batch
                 for i, (output, img_id) in enumerate(zip(outputs, batch_image_ids)):
-                    # Get image size if available
-                    if isinstance(batch, dict) and 'orig_size' in batch:
-                        img_h, img_w = batch['orig_size'][i] if isinstance(batch['orig_size'], list) else batch['orig_size']
-                    else:
-                        # Use default size if not provided
-                        img_h, img_w = batch_images.shape[2:] if len(batch_images.shape) == 4 else (batch_images.shape[1], batch_images.shape[2])
-                    
+                    # # Get image size if available
+                    # if isinstance(batch, dict) and 'orig_size' in batch:
+                    #     img_h, img_w = batch['orig_size'][i] if isinstance(batch['orig_size'], list) else batch['orig_size']
+                    # else:
+                    #     # Use default size if not provided
+                    #     img_h, img_w = batch_images.shape[2:] if len(batch_images.shape) == 4 else (batch_images.shape[1], batch_images.shape[2])
+                    img_h, img_w=batch['target'][i]['orig_size']
                     # Handle different output formats
                     if isinstance(output, dict):
                         # Standard format with boxes, scores, labels
