@@ -11,7 +11,12 @@ from PIL import Image
 
 from modeling_yolohf import register_yolo_architecture, YoloConfig          
 from transformers import AutoModelForObjectDetection
-from multidatasets import coco_names, kitti_to_coco, DetectionDataset
+from multidatasets import coco_names, original_coco_id_mapping, kitti_to_coco, DetectionDataset
+from modeling_yolohf import (
+    YoloDetectionModel,
+    register_yolo_architecture,
+    YoloConfig
+)
 
 class MultiModels:
     """
@@ -479,7 +484,7 @@ class MultiModels:
             iou_thres=iou_thres,
             max_det=max_det,
             output_dir=output_dir
-        )
+        )#list of dicts, each dict is one object with 'image_id'
         
         # Save detections to file
         if output_dir:
@@ -492,7 +497,7 @@ class MultiModels:
         if hasattr(dataset, '_coco') and dataset._coco is not None:
             # Dataset already has COCO ground truth
             print("Using dataset's existing COCO ground truth")
-            coco_gt = dataset._coco
+            coco_gt = dataset._coco #pycocotools.coco.COCO object
         elif hasattr(dataset, 'coco_gt') and dataset.coco_gt is not None:
             # Dataset already has COCO ground truth
             print("Using dataset's existing COCO ground truth")
@@ -507,16 +512,16 @@ class MultiModels:
             coco_gt = self._convert_dataset_to_coco(dataset)
         
         # Debug: Print information about ground truth and results
-        gt_img_ids = set(coco_gt.getImgIds())
-        result_img_ids = set(r['image_id'] for r in coco_results)
+        gt_img_ids = set(coco_gt.getImgIds()) #5000 images
+        result_img_ids = set(r['image_id'] for r in coco_results) #4945 images
         
         print(f"Ground truth has {len(gt_img_ids)} images")
         print(f"Results contain {len(result_img_ids)} unique image IDs")
         print(f"Overlap: {len(gt_img_ids.intersection(result_img_ids))} images")
         
         # Check if there are any categories in the ground truth
-        gt_cat_ids = set(coco_gt.getCatIds())
-        result_cat_ids = set(r['category_id'] for r in coco_results)
+        gt_cat_ids = set(coco_gt.getCatIds()) #1-90, total 80
+        result_cat_ids = set(r['category_id'] for r in coco_results) #0-79, total 80
         
         print(f"Ground truth has {len(gt_cat_ids)} categories: {list(gt_cat_ids)[:10]}")
         print(f"Results contain {len(result_cat_ids)} unique category IDs: {list(result_cat_ids)[:10]}")
@@ -747,6 +752,9 @@ class MultiModels:
                             else:
                                 category_id = int(label)
                             
+                            # Map model's continuous category IDs to COCO's non-continuous IDs
+                            # COCO uses specific IDs that aren't sequential
+                            
                             # Create detection entry
                             # detection = {
                             #     'image_id': int(img_id) if not isinstance(img_id, str) else hash(img_id) % 10000,
@@ -756,10 +764,15 @@ class MultiModels:
                             #     'area': float((x2 - x1) * (y2 - y1)),
                             #     'iscrowd': 0
                             # }
-                            # Create detection entry with consistent image ID
+                            # Use the mapping if available, otherwise add 1 (0->1, 1->2, etc.)
+                            if category_id in original_coco_id_mapping:
+                                mapped_category_id = original_coco_id_mapping[category_id]
+                            else:
+                                # Fallback to simple +1 mapping for categories not in the mapping
+                                mapped_category_id = category_id + 1
                             detection = {
                                 'image_id': numeric_img_id,
-                                'category_id': category_id,
+                                'category_id': mapped_category_id,
                                 'bbox': coco_box,
                                 'score': float(pred_scores[box_idx]),
                                 'area': float((x2 - x1) * (y2 - y1)),
