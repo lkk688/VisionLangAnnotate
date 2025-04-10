@@ -700,13 +700,9 @@ class MultiModels:
                                 category_id = 0
                         else:
                             category_id = int(label)
-                        
-                        # Use the mapping if available, otherwise add 1 (0->1, 1->2, etc.)
-                        if category_id in original_coco_id_mapping:
-                            mapped_category_id = original_coco_id_mapping[category_id]
-                        else:
-                            # Fallback to simple +1 mapping for categories not in the mapping
-                            mapped_category_id = category_id + 1
+                        # Map the category ID using the helper function
+                        mapped_category_id = self._map_category_id(category_id)
+
                         detection = {
                             'image_id': numeric_img_id,
                             'category_id': mapped_category_id,
@@ -723,6 +719,60 @@ class MultiModels:
                         pred_boxes=pred_boxes, pred_scores=pred_scores, pred_labels=pred_labels, output_dir=output_dir)
         return results
     
+    def _map_category_id(self, category_id):
+        """
+        Map model-specific category IDs to standard COCO category IDs.
+        
+        Args:
+            category_id: Original category ID from model prediction
+            
+        Returns:
+            Mapped category ID compatible with COCO evaluation
+        """
+        # Handle different ID mappings based on model type
+        if hasattr(self, 'model_type'):
+            if self.model_type in ['detr', 'rt-detr', 'rt-detrv2']:
+                # DETR models use COCO 91-class format (with indices 0-90)
+                # Map to standard COCO 80-class format (with indices 1-90)
+                if category_id in inverse_coco_id_mapping:
+                    return inverse_coco_id_mapping[category_id]
+                else:
+                    # Skip background class (0) and other non-mapped classes
+                    # Return original ID as fallback
+                    return category_id
+            elif self.model_type == 'vitdet':
+                # ViTDet uses LVIS categories, map to COCO if possible
+                # For evaluation purposes, we'll only keep COCO classes
+                if hasattr(self.model, 'config') and hasattr(self.model.config, 'id2label'):
+                    # Try to match by name to COCO classes
+                    label_name = self.model.config.id2label.get(category_id, "")
+                    # Find matching COCO class by name
+                    for coco_id, coco_name in self.class_names.items():
+                        if label_name.lower() in coco_name.lower() or coco_name.lower() in label_name.lower():
+                            return coco_id
+                    # No matching COCO class found, return original
+                    return category_id
+                else:
+                    # No mapping available, return original
+                    return category_id
+            elif self.model_type == 'yolov8':
+                # YOLOv8 uses 0-79 indices for COCO classes
+                # Map to standard COCO 1-90 format
+                return category_id + 1
+            else:
+                # Default mapping for other model types
+                if category_id in original_coco_id_mapping:
+                    return original_coco_id_mapping[category_id]
+                else:
+                    # Try direct mapping (add 1 to convert 0-indexed to 1-indexed)
+                    return category_id + 1
+        else:
+            # Fallback when model_type is not available
+            if category_id in original_coco_id_mapping:
+                return original_coco_id_mapping[category_id]
+            else:
+                return category_id + 1
+
     def vis_batch_inferenceresults(self, batch, i, img_id, \
         pred_boxes, pred_scores, pred_labels, output_dir):
         # Try to get original image for visualization
@@ -1035,7 +1085,7 @@ class MultiModels:
                     #map from the original coco id to the modified coco 80 class id
                     #coco80classcat_id = inverse_coco_id_mapping[cat_id]
                     # Handle case where cat_id is not in the mapping
-                    cat_name = self._get_category_name(cat_id)
+                    cat_name = self._get_category_name(cat_id, cocogt_id=True)
                     # Draw label
                     cv2.putText(img, f"GT: {cat_name}", (x1, y1 - 10), 
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, gt_color, 2)
@@ -1839,7 +1889,7 @@ class MultiModels:
         
         return summary_metrics
 
-    def _get_category_name(self, cat_id, model_type=None):
+    def _get_category_name(self, cat_id, model_type=None, cocogt_id=False):
         """
         Get category name from category ID, handling different model indexing schemes.
         
@@ -1853,7 +1903,7 @@ class MultiModels:
         #The COCO dataset has 80 categories with IDs ranging from 1-90 (with some gaps), 
         # but DETR might be using a continuous 0-91 indexing or some other scheme.
         # For DETR models, which might use a different indexing scheme
-        if 'detr' in self.model_type.lower():
+        if cocogt_id==False and 'detr' in self.model_type.lower():
             # If the model has its own category mapping, use that
             if hasattr(self.model, 'config') and hasattr(self.model.config, 'id2label'):
                 return self.model.config.id2label.get(cat_id, f"class_{cat_id}")
@@ -2832,9 +2882,9 @@ class MultiModels:
                 # Get label
                 if i < len(gt_labels):
                     label_id = int(gt_labels[i])
-                    coco80classcat_id = label_id #inverse_coco_id_mapping[label_id]
-                    label_name = self.class_names.get(coco80classcat_id, f"class_{coco80classcat_id}")
-                    
+                    #coco80classcat_id = label_id #inverse_coco_id_mapping[label_id]
+                    #label_name = self.class_names.get(coco80classcat_id, f"class_{coco80classcat_id}")
+                    label_name = self._get_category_name(label_id, cocogt_id=True)
                     # Draw label
                     cv2.putText(img, f"GT: {label_name}", (x1, y1 - 10), 
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, box_color, 2)
@@ -3043,7 +3093,7 @@ class MultiModels:
                     label_id = int(gt_labels[i])
                     #coco80classcat_id = inverse_coco_id_mapping[label_id]
                     # Handle case where cat_id is not in the mapping
-                    cat_name = self._get_category_name(cat_id)
+                    cat_name = self._get_category_name(cat_id, cocogt_id=True)
                     # Draw label
                     cv2.putText(img, f"GT: {label_name}", (x1, y1 - 10), 
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, gt_color, 2)
@@ -3340,12 +3390,10 @@ class MultiModels:
                     if hasattr(self.model, 'loss'):
                         # YOLO-style models
                         loss, loss_items = self.model.loss(batch)
-                    elif 'labels' in batch:
-                        # HuggingFace-style models
-                        outputs = self.model(
-                            pixel_values=batch.get('pixel_values', batch.get('img')),
-                            labels=batch.get('labels', batch.get('target'))
-                        )
+                    elif 'labels' in batch or 'target' in batch:
+                        # HuggingFace-style models - use helper function to convert batch
+                        hf_batch = self._convert_to_hf_format(batch)
+                        outputs = self.model(**hf_batch)
                         loss = outputs.loss
                         loss_items = {'loss': loss.item()}
                     else:
@@ -3371,101 +3419,23 @@ class MultiModels:
                 if hasattr(self.model, 'loss'):
                     # YOLO-style models
                     loss, loss_items = self.model.loss(batch)
-                elif 'labels' in batch:
-                    # HuggingFace-style models
-                    outputs = self.model(
-                        pixel_values=batch.get('pixel_values', batch.get('img')),
-                        labels=batch.get('labels', batch.get('target'))
-                    )
+                elif 'labels' in batch or 'target' in batch:
+                    # HuggingFace-style models - use helper function to convert batch
+                    hf_batch = self._convert_to_hf_format(batch)
+                    outputs = self.model(**hf_batch)
                     loss = outputs.loss
                     loss_items = {'loss': loss.item()}
                 else:
                     # Generic case - try to infer inputs and outputs
                     # HuggingFace-style models
                     if self.model_type in ['detr', 'rt-detr', 'rt-detrv2', 'vitdet']:
-                        # Create a new batch dict with the correct parameter names
-                        hf_batch = {}
-                        
-                        # Convert 'img' to 'pixel_values'
-                        if 'img' in batch:
-                            hf_batch['pixel_values'] = batch['img']
-                        elif 'pixel_values' in batch:
-                            hf_batch['pixel_values'] = batch['pixel_values']
-                            
-                        # Convert 'target' to properly formatted 'labels'
-                        if 'target' in batch:
-                            # Format the target data for HuggingFace models
-                            # DETR expects labels to be a list of dicts with 'class_labels' and 'boxes'
-                            formatted_labels = []
-                            for target_item in batch['target']:
-                                # Check if target is already in the right format
-                                if isinstance(target_item, dict) and 'class_labels' in target_item:
-                                    # Ensure all tensors in the dict are on the correct device
-                                    formatted_target = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v 
-                                                      for k, v in target_item.items()}
-                                    formatted_labels.append(formatted_target)
-                                else:
-                                    # Convert to the expected format
-                                    # Assuming target_item has 'boxes' and 'labels' fields
-                                    formatted_target = {}
-                                    
-                                    if isinstance(target_item, dict):
-                                        # If target is a dict, extract boxes and labels
-                                        if 'boxes' in target_item:
-                                            formatted_target['boxes'] = target_item['boxes'].to(self.device)
-                                        if 'labels' in target_item:
-                                            formatted_target['class_labels'] = target_item['labels'].to(self.device)
-                                        elif 'class_labels' in target_item:
-                                            formatted_target['class_labels'] = target_item['class_labels'].to(self.device)
-                                    elif isinstance(target_item, torch.Tensor) and target_item.dim() == 2:
-                                        # If target is a tensor with shape [N, 5] (class, x, y, w, h)
-                                        # Extract class labels and convert boxes
-                                        target_item = target_item.to(self.device)  # Move tensor to device
-                                        if target_item.size(1) >= 5:
-                                            formatted_target['class_labels'] = target_item[:, 0].long()
-                                            # Convert xywh to xyxy format if needed
-                                            boxes = target_item[:, 1:5]
-                                            if boxes.size(0) > 0:
-                                                # Check if boxes are in xywh format (common in YOLO)
-                                                if torch.all((boxes[:, 2:] >= 0) & (boxes[:, 2:] <= 1)):
-                                                    # Convert normalized xywh to xyxy
-                                                    x, y, w, h = boxes[:, 0], boxes[:, 1], boxes[:, 2], boxes[:, 3]
-                                                    x1 = x - w/2
-                                                    y1 = y - h/2
-                                                    x2 = x + w/2
-                                                    y2 = y + h/2
-                                                    formatted_target['boxes'] = torch.stack([x1, y1, x2, y2], dim=1)
-                                                else:
-                                                    formatted_target['boxes'] = boxes
-                                    
-                                    # Add to formatted labels list
-                                    if 'boxes' in formatted_target and 'class_labels' in formatted_target:
-                                        formatted_labels.append(formatted_target)
-                            
-                            # Set the formatted labels
-                            hf_batch['labels'] = formatted_labels
-                        elif 'labels' in batch:
-                            # Ensure labels are properly formatted and on the correct device
-                            if isinstance(batch['labels'], list):
-                                # If labels is a list of dicts, ensure all tensors are on the device
-                                formatted_labels = []
-                                for label_item in batch['labels']:
-                                    if isinstance(label_item, dict):
-                                        formatted_label = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v 
-                                                         for k, v in label_item.items()}
-                                        formatted_labels.append(formatted_label)
-                                    else:
-                                        # If not a dict, move to device if it's a tensor
-                                        formatted_labels.append(label_item.to(self.device) if isinstance(label_item, torch.Tensor) else label_item)
-                                hf_batch['labels'] = formatted_labels
-                            else:
-                                hf_batch['labels'] = batch['labels'].to(self.device) if isinstance(batch['labels'], torch.Tensor) else batch['labels']
-                            
-                        # Use the converted batch
+                        # Use helper function to convert batch to HuggingFace format
+                        hf_batch = self._convert_to_hf_format(batch)
                         outputs = self.model(**hf_batch)
                     else:
                         # For other model types, try with original batch
                         outputs = self.model(**batch)
+                    
                     # Extract loss from outputs
                     if hasattr(outputs, 'loss'):
                         loss = outputs.loss
@@ -3490,6 +3460,218 @@ class MultiModels:
         
         return avg_loss
     
+    def _convert_to_hf_format(self, batch):
+        """
+        Convert a batch to the format expected by HuggingFace models.
+        Performs data validation and handles different input formats.
+        
+        Args:
+            batch: Input batch dictionary
+            
+        Returns:
+            Dictionary formatted for HuggingFace models
+        """
+        hf_batch = {}
+        
+        # Convert 'img' to 'pixel_values'
+        if 'img' in batch:
+            hf_batch['pixel_values'] = batch['img']
+        elif 'pixel_values' in batch:
+            hf_batch['pixel_values'] = batch['pixel_values']
+        
+        # Handle labels/targets
+        if 'target' in batch:
+            # Format the target data for HuggingFace models
+            # DETR expects labels to be a list of dicts with 'class_labels' and 'boxes'
+            formatted_labels = []
+            
+            for target_item in batch['target']:
+                # Skip None or empty targets
+                if target_item is None:
+                    continue
+                    
+                # Check if target is already in the right format
+                if isinstance(target_item, dict) and 'class_labels' in target_item:
+                    # Ensure all tensors in the dict are on the correct device
+                    formatted_target = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v 
+                                      for k, v in target_item.items()}
+                    
+                    # Validate boxes format and values
+                    if 'boxes' in formatted_target:
+                        boxes = formatted_target['boxes']
+                        if self._validate_and_fix_boxes(boxes, formatted_target):
+                            formatted_labels.append(formatted_target)
+                else:
+                    # Convert to the expected format
+                    formatted_target = self._format_target_item(target_item)
+                    if formatted_target and 'boxes' in formatted_target and 'class_labels' in formatted_target:
+                        formatted_labels.append(formatted_target)
+            
+            # Set the formatted labels
+            if formatted_labels:
+                hf_batch['labels'] = formatted_labels
+        elif 'labels' in batch:
+            # Ensure labels are properly formatted and on the correct device
+            if isinstance(batch['labels'], list):
+                # If labels is a list of dicts, ensure all tensors are on the device
+                formatted_labels = []
+                for label_item in batch['labels']:
+                    if label_item is None:
+                        continue
+                        
+                    if isinstance(label_item, dict):
+                        formatted_label = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v 
+                                         for k, v in label_item.items()}
+                        
+                        # Rename 'labels' to 'class_labels' if needed
+                        if 'labels' in formatted_label and 'class_labels' not in formatted_label:
+                            formatted_label['class_labels'] = formatted_label.pop('labels')
+                            
+                        # Validate boxes format and values
+                        if 'boxes' in formatted_label:
+                            if self._validate_and_fix_boxes(formatted_label['boxes'], formatted_label):
+                                formatted_labels.append(formatted_label)
+                    else:
+                        # If not a dict, try to format it
+                        formatted_item = self._format_target_item(label_item)
+                        if formatted_item:
+                            formatted_labels.append(formatted_item)
+                
+                if formatted_labels:
+                    hf_batch['labels'] = formatted_labels
+            else:
+                # Single tensor or other format - try to convert
+                formatted_item = self._format_target_item(batch['labels'])
+                if formatted_item:
+                    hf_batch['labels'] = [formatted_item]
+        
+        return hf_batch
+    
+    def _format_target_item(self, target_item):
+        """
+        Format a single target item to the expected HuggingFace format.
+        
+        Args:
+            target_item: Target item to format
+            
+        Returns:
+            Formatted target dictionary or None if invalid
+        """
+        formatted_target = {}
+        
+        # Move tensor to device if needed
+        if isinstance(target_item, torch.Tensor):
+            target_item = target_item.to(self.device)
+        
+        if isinstance(target_item, dict):
+            # If target is a dict, extract boxes and labels
+            if 'boxes' in target_item:
+                formatted_target['boxes'] = target_item['boxes'].to(self.device)
+            
+            # Handle different label field names
+            if 'labels' in target_item:
+                formatted_target['class_labels'] = target_item['labels'].to(self.device)
+            elif 'class_labels' in target_item:
+                formatted_target['class_labels'] = target_item['class_labels'].to(self.device)
+                
+        elif isinstance(target_item, torch.Tensor) and target_item.dim() == 2:
+            # If target is a tensor with shape [N, 5] (class, x, y, w, h)
+            if target_item.size(1) >= 5:
+                # Extract class labels
+                formatted_target['class_labels'] = target_item[:, 0].long()
+                
+                # Extract and convert boxes
+                boxes = target_item[:, 1:5]
+                if boxes.size(0) > 0:
+                    # Check if boxes are in xywh format (common in YOLO)
+                    if torch.all((boxes[:, 2:] >= 0) & (boxes[:, 2:] <= 1)):
+                        # Convert normalized xywh to xyxy
+                        x, y, w, h = boxes[:, 0], boxes[:, 1], boxes[:, 2], boxes[:, 3]
+                        
+                        # Check for valid values
+                        if not (torch.isnan(x).any() or torch.isnan(y).any() or 
+                                torch.isnan(w).any() or torch.isnan(h).any()):
+                            # Convert to corner format
+                            x1 = torch.clamp(x - w/2, 0, 1)
+                            y1 = torch.clamp(y - h/2, 0, 1)
+                            x2 = torch.clamp(x + w/2, 0, 1)
+                            y2 = torch.clamp(y + h/2, 0, 1)
+                            
+                            formatted_target['boxes'] = torch.stack([x1, y1, x2, y2], dim=1)
+                    else:
+                        # Assume boxes are already in xyxy format
+                        formatted_target['boxes'] = boxes
+        
+        # Validate the formatted target
+        if 'boxes' in formatted_target and 'class_labels' in formatted_target:
+            # Ensure boxes and class_labels have the same batch dimension
+            if len(formatted_target['boxes']) != len(formatted_target['class_labels']):
+                # If mismatch, use the smaller size
+                min_size = min(len(formatted_target['boxes']), len(formatted_target['class_labels']))
+                formatted_target['boxes'] = formatted_target['boxes'][:min_size]
+                formatted_target['class_labels'] = formatted_target['class_labels'][:min_size]
+            
+            # Validate box format and values
+            return formatted_target if self._validate_and_fix_boxes(formatted_target['boxes'], formatted_target) else None
+        
+        return None if not formatted_target else formatted_target
+    
+    def _validate_and_fix_boxes(self, boxes, target_dict):
+        """
+        Validate and fix box coordinates.
+        
+        Args:
+            boxes: Tensor of box coordinates
+            target_dict: Target dictionary containing the boxes
+            
+        Returns:
+            Boolean indicating if the boxes are valid after fixes
+        """
+        if boxes is None or boxes.size(0) == 0:
+            return False
+            
+        # Check for NaN or Inf values
+        if torch.isnan(boxes).any() or torch.isinf(boxes).any():
+            # Get mask of valid boxes
+            valid_mask = ~(torch.isnan(boxes).any(dim=1) | torch.isinf(boxes).any(dim=1))
+            
+            # If no valid boxes remain, return False
+            if not valid_mask.any():
+                return False
+                
+            # Keep only valid boxes and corresponding labels
+            target_dict['boxes'] = boxes[valid_mask]
+            if 'class_labels' in target_dict:
+                target_dict['class_labels'] = target_dict['class_labels'][valid_mask]
+        
+        # Ensure boxes are in the correct format (x1, y1, x2, y2)
+        # Check if boxes might be in wrong format (x1 > x2 or y1 > y2)
+        boxes = target_dict['boxes']
+        if (boxes[:, 0] > boxes[:, 2]).any() or (boxes[:, 1] > boxes[:, 3]).any():
+            # Swap coordinates to ensure x1 < x2 and y1 < y2
+            x1 = torch.min(boxes[:, 0], boxes[:, 2])
+            y1 = torch.min(boxes[:, 1], boxes[:, 3])
+            x2 = torch.max(boxes[:, 0], boxes[:, 2])
+            y2 = torch.max(boxes[:, 1], boxes[:, 3])
+            target_dict['boxes'] = torch.stack([x1, y1, x2, y2], dim=1)
+        
+        # Ensure boxes have non-zero area
+        boxes = target_dict['boxes']
+        areas = (boxes[:, 2] - boxes[:, 0]) * (boxes[:, 3] - boxes[:, 1])
+        valid_mask = areas > 0
+        
+        # If no valid boxes remain, return False
+        if not valid_mask.any():
+            return False
+            
+        # Keep only valid boxes and corresponding labels
+        if not valid_mask.all():
+            target_dict['boxes'] = boxes[valid_mask]
+            if 'class_labels' in target_dict:
+                target_dict['class_labels'] = target_dict['class_labels'][valid_mask]
+        
+        return True
+
     def _validate(self, dataloader, epoch):
         """
         Validate the model on a dataset.
@@ -4064,5 +4246,5 @@ def train_multimodels():
 
 if __name__ == "__main__":
     #test_rtdetr()
-    #test_multimodels()
+    test_multimodels()
     train_multimodels()
