@@ -502,6 +502,7 @@ class MultiModels:
             output_dir=output_dir
         )#list of dicts, each dict is one object with 'image_id'
         
+        self.print_category_id_stats()
         # Save detections to file
         if output_dir:
             detections_file = os.path.join(output_dir, "coco_detections.json")
@@ -729,17 +730,29 @@ class MultiModels:
         Returns:
             Mapped category ID compatible with COCO evaluation
         """
+        # Debug: Track category ID distribution
+        if not hasattr(self, '_category_id_stats'):
+            self._category_id_stats = {
+                'original': {},
+                'mapped': {}
+            }
+        # Record original category ID
+        if category_id not in self._category_id_stats['original']:
+            self._category_id_stats['original'][category_id] = 0
+        self._category_id_stats['original'][category_id] += 1
+
+        newcategory_id = category_id
         # Handle different ID mappings based on model type
         if hasattr(self, 'model_type'):
             if self.model_type in ['detr', 'rt-detr', 'rt-detrv2']:
                 # DETR models use COCO 91-class format (with indices 0-90)
                 # Map to standard COCO 80-class format (with indices 1-90)
-                if category_id in inverse_coco_id_mapping:
-                    return inverse_coco_id_mapping[category_id]
-                else:
+                # if category_id in inverse_coco_id_mapping:
+                #     return inverse_coco_id_mapping[category_id]
+                # else:
                     # Skip background class (0) and other non-mapped classes
                     # Return original ID as fallback
-                    return category_id
+                newcategory_id = category_id
             elif self.model_type == 'vitdet':
                 # ViTDet uses LVIS categories, map to COCO if possible
                 # For evaluation purposes, we'll only keep COCO classes
@@ -751,27 +764,67 @@ class MultiModels:
                         if label_name.lower() in coco_name.lower() or coco_name.lower() in label_name.lower():
                             return coco_id
                     # No matching COCO class found, return original
-                    return category_id
+                    newcategory_id =  category_id
                 else:
                     # No mapping available, return original
-                    return category_id
-            elif self.model_type == 'yolov8':
-                # YOLOv8 uses 0-79 indices for COCO classes
-                # Map to standard COCO 1-90 format
-                return category_id + 1
+                    newcategory_id = category_id
             else:
                 # Default mapping for other model types
                 if category_id in original_coco_id_mapping:
-                    return original_coco_id_mapping[category_id]
+                    newcategory_id = original_coco_id_mapping[category_id]
                 else:
                     # Try direct mapping (add 1 to convert 0-indexed to 1-indexed)
-                    return category_id + 1
+                    newcategory_id = category_id + 1
         else:
             # Fallback when model_type is not available
             if category_id in original_coco_id_mapping:
-                return original_coco_id_mapping[category_id]
+                newcategory_id = original_coco_id_mapping[category_id]
             else:
-                return category_id + 1
+                newcategory_id = category_id + 1
+        
+        # Record mapped category ID
+        if newcategory_id not in self._category_id_stats['mapped']:
+            self._category_id_stats['mapped'][newcategory_id] = 0
+        self._category_id_stats['mapped'][newcategory_id] += 1
+        return newcategory_id
+
+    def print_category_id_stats(self):
+        """
+        Print statistics about category IDs detected by the model.
+        Shows distribution of original and mapped category IDs.
+        """
+        if not hasattr(self, '_category_id_stats'):
+            print("No category ID statistics available. Run inference first.")
+            return
+        
+        print("\n===== Category ID Statistics =====")
+        print("\nOriginal Category IDs from Model:")
+        orig_ids = sorted(self._category_id_stats['original'].keys())
+        print(f"Range: {min(orig_ids)} to {max(orig_ids)}")
+        print(f"Total unique IDs: {len(orig_ids)}")
+        print("Top 10 most frequent original category IDs:")
+        sorted_orig = sorted(self._category_id_stats['original'].items(), 
+                            key=lambda x: x[1], reverse=True)
+        for cat_id, count in sorted_orig[:10]:
+            cat_name = self._get_category_name(cat_id) if hasattr(self, '_get_category_name') else "Unknown"
+            print(f"  ID {cat_id} ({cat_name}): {count} detections")
+        
+        print("\nMapped Category IDs (after mapping):")
+        mapped_ids = sorted(self._category_id_stats['mapped'].keys())
+        print(f"Range: {min(mapped_ids)} to {max(mapped_ids)}")
+        print(f"Total unique IDs: {len(mapped_ids)}")
+        print("Top 10 most frequent mapped category IDs:")
+        sorted_mapped = sorted(self._category_id_stats['mapped'].items(), 
+                              key=lambda x: x[1], reverse=True)
+        for cat_id, count in sorted_mapped[:10]:
+            cat_name = self._get_category_name(cat_id) if hasattr(self, '_get_category_name') else "Unknown"
+            print(f"  ID {cat_id} ({cat_name}): {count} detections")
+        
+        # Check for potential issues
+        if -1 in self._category_id_stats['mapped']:
+            print(f"\nWARNING: Found {self._category_id_stats['mapped'][-1]} detections with ID -1 (skipped)")
+        
+        print("\n==================================")
 
     def vis_batch_inferenceresults(self, batch, i, img_id, \
         pred_boxes, pred_scores, pred_labels, output_dir):
@@ -1907,11 +1960,15 @@ class MultiModels:
             # If the model has its own category mapping, use that
             if hasattr(self.model, 'config') and hasattr(self.model.config, 'id2label'):
                 return self.model.config.id2label.get(cat_id, f"class_{cat_id}")
-        
+        elif cocogt_id==True:
+            return self.class_names.get(cat_id+1, f"class_{cat_id}")
         # For standard COCO models
         try:
             # Try to map to standard COCO 80-class index
-            coco80classcat_id = inverse_coco_id_mapping.get(cat_id, cat_id)
+            if 'detr' in self.model_type.lower():
+                coco80classcat_id = cat_id
+            else:
+                coco80classcat_id = inverse_coco_id_mapping.get(cat_id, cat_id)
             return self.class_names.get(coco80classcat_id, f"class_{cat_id}")
         except:
             # Fallback for any other case
@@ -3479,15 +3536,22 @@ class MultiModels:
         elif 'pixel_values' in batch:
             hf_batch['pixel_values'] = batch['pixel_values']
         
+        # Get the batch size from the image tensor
+        batch_size = len(hf_batch['pixel_values']) if 'pixel_values' in hf_batch else 0
+
         # Handle labels/targets
         if 'target' in batch:
             # Format the target data for HuggingFace models
             # DETR expects labels to be a list of dicts with 'class_labels' and 'boxes'
             formatted_labels = []
+            valid_indices = []  # Track which indices have valid labels
             
-            for target_item in batch['target']:
+            for i, target_item in enumerate(batch['target']):
                 # Skip None or empty targets
                 if target_item is None:
+                    # Add a placeholder empty target to maintain batch size
+                    formatted_labels.append({'boxes': torch.zeros((0, 4), device=self.device),
+                                           'class_labels': torch.zeros(0, dtype=torch.long, device=self.device)})
                     continue
                     
                 # Check if target is already in the right format
@@ -3501,15 +3565,53 @@ class MultiModels:
                         boxes = formatted_target['boxes']
                         if self._validate_and_fix_boxes(boxes, formatted_target):
                             formatted_labels.append(formatted_target)
+                            valid_indices.append(i)
+                        else:
+                            # Add empty target to maintain batch size
+                            formatted_labels.append({'boxes': torch.zeros((0, 4), device=self.device),
+                                                  'class_labels': torch.zeros(0, dtype=torch.long, device=self.device)})
+                    else:
+                        # Add empty target to maintain batch size
+                        formatted_labels.append({'boxes': torch.zeros((0, 4), device=self.device),
+                                              'class_labels': torch.zeros(0, dtype=torch.long, device=self.device)})
                 else:
                     # Convert to the expected format
                     formatted_target = self._format_target_item(target_item)
                     if formatted_target and 'boxes' in formatted_target and 'class_labels' in formatted_target:
                         formatted_labels.append(formatted_target)
-            
+                        valid_indices.append(i)
+                    else:
+                        # Add empty target to maintain batch size
+                        formatted_labels.append({'boxes': torch.zeros((0, 4), device=self.device),
+                                              'class_labels': torch.zeros(0, dtype=torch.long, device=self.device)})
             # Set the formatted labels
             if formatted_labels:
-                hf_batch['labels'] = formatted_labels
+                # Ensure we have the same number of labels as images
+                if len(formatted_labels) == batch_size:
+                    hf_batch['labels'] = formatted_labels
+                else:
+                    # If we have a mismatch, we need to adjust the batch
+                    print(f"Warning: Label count mismatch. Images: {batch_size}, Labels: {len(formatted_labels)}")
+                    
+                    # Option 1: Pad with empty labels to match batch size
+                    while len(formatted_labels) < batch_size:
+                        formatted_labels.append({'boxes': torch.zeros((0, 4), device=self.device),
+                                              'class_labels': torch.zeros(0, dtype=torch.long, device=self.device)})
+                    
+                    # Option 2: If we have too many labels, trim to match batch size
+                    if len(formatted_labels) > batch_size:
+                        formatted_labels = formatted_labels[:batch_size]
+                    
+                    hf_batch['labels'] = formatted_labels
+                    
+                    # If we have valid indices, we might need to adjust pixel_values too
+                    if 'pixel_values' in hf_batch and valid_indices and len(valid_indices) != batch_size:
+                        # This is a more drastic approach - only keep images with valid labels
+                        # Only do this if absolutely necessary
+                        if len(valid_indices) > 0 and len(valid_indices) < batch_size:
+                            print(f"Warning: Adjusting pixel_values to match valid labels. This may affect training.")
+                            hf_batch['pixel_values'] = hf_batch['pixel_values'][valid_indices]
+                            hf_batch['labels'] = [formatted_labels[i] for i in range(len(valid_indices))]
         elif 'labels' in batch:
             # Ensure labels are properly formatted and on the correct device
             if isinstance(batch['labels'], list):
@@ -3544,7 +3646,17 @@ class MultiModels:
                 formatted_item = self._format_target_item(batch['labels'])
                 if formatted_item:
                     hf_batch['labels'] = [formatted_item]
-        
+        # Final check to ensure batch size consistency
+        if 'pixel_values' in hf_batch and 'labels' in hf_batch:
+            if len(hf_batch['pixel_values']) != len(hf_batch['labels']):
+                print(f"Critical error: Batch size mismatch after conversion. "
+                      f"Images: {len(hf_batch['pixel_values'])}, Labels: {len(hf_batch['labels'])}")
+                
+                # Force them to be the same size by using the smaller size
+                min_size = min(len(hf_batch['pixel_values']), len(hf_batch['labels']))
+                hf_batch['pixel_values'] = hf_batch['pixel_values'][:min_size]
+                hf_batch['labels'] = hf_batch['labels'][:min_size]
+
         return hf_batch
     
     def _format_target_item(self, target_item):
