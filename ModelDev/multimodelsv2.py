@@ -3381,8 +3381,95 @@ class MultiModels:
                     loss_items = {'loss': loss.item()}
                 else:
                     # Generic case - try to infer inputs and outputs
-                    outputs = self.model(**batch)
-                    if isinstance(outputs, dict) and 'loss' in outputs:
+                    # HuggingFace-style models
+                    if self.model_type in ['detr', 'rt-detr', 'rt-detrv2', 'vitdet']:
+                        # Create a new batch dict with the correct parameter names
+                        hf_batch = {}
+                        
+                        # Convert 'img' to 'pixel_values'
+                        if 'img' in batch:
+                            hf_batch['pixel_values'] = batch['img']
+                        elif 'pixel_values' in batch:
+                            hf_batch['pixel_values'] = batch['pixel_values']
+                            
+                        # Convert 'target' to properly formatted 'labels'
+                        if 'target' in batch:
+                            # Format the target data for HuggingFace models
+                            # DETR expects labels to be a list of dicts with 'class_labels' and 'boxes'
+                            formatted_labels = []
+                            for target_item in batch['target']:
+                                # Check if target is already in the right format
+                                if isinstance(target_item, dict) and 'class_labels' in target_item:
+                                    # Ensure all tensors in the dict are on the correct device
+                                    formatted_target = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v 
+                                                      for k, v in target_item.items()}
+                                    formatted_labels.append(formatted_target)
+                                else:
+                                    # Convert to the expected format
+                                    # Assuming target_item has 'boxes' and 'labels' fields
+                                    formatted_target = {}
+                                    
+                                    if isinstance(target_item, dict):
+                                        # If target is a dict, extract boxes and labels
+                                        if 'boxes' in target_item:
+                                            formatted_target['boxes'] = target_item['boxes'].to(self.device)
+                                        if 'labels' in target_item:
+                                            formatted_target['class_labels'] = target_item['labels'].to(self.device)
+                                        elif 'class_labels' in target_item:
+                                            formatted_target['class_labels'] = target_item['class_labels'].to(self.device)
+                                    elif isinstance(target_item, torch.Tensor) and target_item.dim() == 2:
+                                        # If target is a tensor with shape [N, 5] (class, x, y, w, h)
+                                        # Extract class labels and convert boxes
+                                        target_item = target_item.to(self.device)  # Move tensor to device
+                                        if target_item.size(1) >= 5:
+                                            formatted_target['class_labels'] = target_item[:, 0].long()
+                                            # Convert xywh to xyxy format if needed
+                                            boxes = target_item[:, 1:5]
+                                            if boxes.size(0) > 0:
+                                                # Check if boxes are in xywh format (common in YOLO)
+                                                if torch.all((boxes[:, 2:] >= 0) & (boxes[:, 2:] <= 1)):
+                                                    # Convert normalized xywh to xyxy
+                                                    x, y, w, h = boxes[:, 0], boxes[:, 1], boxes[:, 2], boxes[:, 3]
+                                                    x1 = x - w/2
+                                                    y1 = y - h/2
+                                                    x2 = x + w/2
+                                                    y2 = y + h/2
+                                                    formatted_target['boxes'] = torch.stack([x1, y1, x2, y2], dim=1)
+                                                else:
+                                                    formatted_target['boxes'] = boxes
+                                    
+                                    # Add to formatted labels list
+                                    if 'boxes' in formatted_target and 'class_labels' in formatted_target:
+                                        formatted_labels.append(formatted_target)
+                            
+                            # Set the formatted labels
+                            hf_batch['labels'] = formatted_labels
+                        elif 'labels' in batch:
+                            # Ensure labels are properly formatted and on the correct device
+                            if isinstance(batch['labels'], list):
+                                # If labels is a list of dicts, ensure all tensors are on the device
+                                formatted_labels = []
+                                for label_item in batch['labels']:
+                                    if isinstance(label_item, dict):
+                                        formatted_label = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v 
+                                                         for k, v in label_item.items()}
+                                        formatted_labels.append(formatted_label)
+                                    else:
+                                        # If not a dict, move to device if it's a tensor
+                                        formatted_labels.append(label_item.to(self.device) if isinstance(label_item, torch.Tensor) else label_item)
+                                hf_batch['labels'] = formatted_labels
+                            else:
+                                hf_batch['labels'] = batch['labels'].to(self.device) if isinstance(batch['labels'], torch.Tensor) else batch['labels']
+                            
+                        # Use the converted batch
+                        outputs = self.model(**hf_batch)
+                    else:
+                        # For other model types, try with original batch
+                        outputs = self.model(**batch)
+                    # Extract loss from outputs
+                    if hasattr(outputs, 'loss'):
+                        loss = outputs.loss
+                    elif isinstance(outputs, dict) and 'loss' in outputs:
                         loss = outputs['loss']
                     else:
                         loss = outputs
@@ -3823,6 +3910,159 @@ def test_multimodels():
             else:
                 print("  No valid evaluation results returned.")
 
+def train_multimodels():
+    """
+    Training function for MultiModels class demonstrating model training
+    on COCO or KITTI datasets with various configurations.
+    """
+    import argparse
+    import os
+    
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(description='Train MultiModels object detection')
+    parser.add_argument('--model', type=str, default='detr', help='Model type (yolov8, detr, rt-detr, rt-detrv2, vitdet)')
+    parser.add_argument('--hub_model', type=str, default="facebook/detr-resnet-50", help='HF Hub model name to fine-tune (e.g., lkk688/yolov8x-model, facebook/detr-resnet-50)')
+    parser.add_argument('--weights', type=str, default="", help='Path to pretrained weights for initialization')
+    parser.add_argument('--dataset', type=str, default='coco', choices=['coco', 'kitti'], help='Dataset to train on')
+    parser.add_argument('--data_dir', type=str, default="/DATA10T/Datasets/COCOoriginal", help='Dataset directory')
+    parser.add_argument('--output_dir', type=str, default="output/train", help='Output directory for checkpoints and logs')
+    parser.add_argument('--epochs', type=int, default=20, help='Number of training epochs')
+    parser.add_argument('--batch_size', type=int, default=16, help='Batch size')
+    parser.add_argument('--img_size', type=int, default=640, help='Image size for training')
+    parser.add_argument('--lr', type=float, default=0.01, help='Initial learning rate')
+    parser.add_argument('--weight_decay', type=float, default=0.0005, help='Weight decay')
+    parser.add_argument('--optimizer', type=str, default='sgd', choices=['sgd', 'adam', 'adamw'], help='Optimizer type')
+    parser.add_argument('--scheduler', type=str, default='cosine', choices=['cosine', 'step', 'linear', 'constant'], help='LR scheduler type')
+    parser.add_argument('--warmup_epochs', type=int, default=3, help='Number of warmup epochs')
+    parser.add_argument('--grad_accum', type=int, default=1, help='Gradient accumulation steps')
+    parser.add_argument('--mixed_precision', action='store_true', help='Use mixed precision training')
+    parser.add_argument('--resume', type=str, default="", help='Resume training from checkpoint')
+    parser.add_argument('--save_interval', type=int, default=10, help='Save checkpoint every N epochs')
+    parser.add_argument('--val_interval', type=int, default=5, help='Run validation every N epochs')
+    parser.add_argument('--seed', type=int, default=42, help='Random seed for reproducibility')
+    args = parser.parse_args()
+    
+    # Set random seed for reproducibility
+    import random
+    import numpy as np
+    import torch
+    
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(args.seed)
+        torch.cuda.manual_seed_all(args.seed)
+    
+    # Create output directory
+    os.makedirs(args.output_dir, exist_ok=True)
+    
+    # Save training arguments
+    import json
+    with open(os.path.join(args.output_dir, 'training_args.json'), 'w') as f:
+        json.dump(vars(args), f, indent=2)
+    
+    # Initialize model
+    print(f"Initializing {args.model} model for training")
+    if args.hub_model:
+        # Load model from Hugging Face Hub
+        print(f"Loading model from Hugging Face Hub: {args.hub_model}")
+        model = MultiModels(model_name=args.hub_model)
+    else:
+        # Create model with specified type
+        model = MultiModels(model_type=args.model, scale='s')
+        if args.weights and os.path.exists(args.weights):
+            print(f"Loading weights from: {args.weights}")
+            model.load_weights(args.weights)
+    
+    # Create datasets
+    print(f"Creating {args.dataset.upper()} datasets")
+    train_dataset = DetectionDataset(
+        dataset_type=args.dataset,
+        data_dir=args.data_dir,
+        split='train',
+        target_size=(args.img_size, args.img_size),
+        augment=False
+    )
+    
+    val_dataset = DetectionDataset(
+        dataset_type=args.dataset,
+        data_dir=args.data_dir,
+        split='val',
+        target_size=(args.img_size, args.img_size),
+        augment=False
+    )
+    
+    print(f"Training dataset size: {len(train_dataset)}")
+    print(f"Validation dataset size: {len(val_dataset)}")
+    
+    # Train the model
+    print(f"Starting training for {args.epochs} epochs")
+    training_results = model.train(
+        train_dataset=train_dataset,
+        val_dataset=val_dataset,
+        epochs=args.epochs,
+        batch_size=args.batch_size,
+        learning_rate=args.lr,
+        weight_decay=args.weight_decay,
+        output_dir=args.output_dir,
+        resume=args.resume if args.resume else None,
+        save_interval=args.save_interval,
+        optimizer_type=args.optimizer,
+        scheduler_type=args.scheduler,
+        warmup_epochs=args.warmup_epochs,
+        gradient_accumulation_steps=args.grad_accum,
+        mixed_precision=args.mixed_precision
+    )
+    
+    # Evaluate the final model
+    print("Evaluating final model")
+    if args.dataset == 'coco':
+        eval_results = model.evaluate_coco(
+            dataset=val_dataset,
+            output_dir=os.path.join(args.output_dir, "eval"),
+            batch_size=args.batch_size // 2,  # Use smaller batch size for evaluation
+            conf_thres=0.25,
+            iou_thres=0.5
+        )
+    else:  # KITTI
+        eval_results = model.evaluate_kitti(
+            dataset=val_dataset,
+            output_dir=os.path.join(args.output_dir, "eval"),
+            batch_size=args.batch_size // 2,
+            conf_thres=0.25,
+            iou_thres=0.5
+        )
+    
+    # Print final evaluation results
+    print("\nFinal Evaluation Results:")
+    if isinstance(eval_results, dict):
+        for metric, value in eval_results.items():
+            if isinstance(value, float):
+                print(f"  {metric}: {value:.4f}")
+            elif isinstance(value, dict):
+                print(f"  {metric}:")
+                for k, v in value.items():
+                    if isinstance(v, float):
+                        print(f"    {k}: {v:.4f}")
+                    else:
+                        print(f"    {k}: {v}")
+            else:
+                print(f"  {metric}: {value}")
+    else:
+        print("  No valid evaluation results returned.")
+    
+    # Save final results
+    with open(os.path.join(args.output_dir, 'final_results.json'), 'w') as f:
+        json.dump({
+            'training': training_results,
+            'evaluation': eval_results
+        }, f, indent=2)
+    
+    print(f"Training completed. Model saved to {args.output_dir}/best.pt and {args.output_dir}/last.pt")
+    print(f"Results saved to {args.output_dir}/final_results.json")
+
 if __name__ == "__main__":
-    test_rtdetr()
-    test_multimodels()
+    #test_rtdetr()
+    #test_multimodels()
+    train_multimodels()

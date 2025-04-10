@@ -911,7 +911,8 @@ class YOLOv8DetectionLoss:
         
         # Get batch data
         batch_size = len(batch['img'])
-        batch_idx = batch.get('batch_idx', torch.zeros(batch_size, device=self.device))
+        #batch_idx = batch.get('batch_idx', torch.zeros(batch_size, device=self.device))
+        batch_idx = torch.zeros(batch_size, device=self.device)
         
         # Process targets
         targets = torch.cat((batch_idx.view(-1, 1), batch['cls'].view(-1, 1), batch['bboxes']), 1)
