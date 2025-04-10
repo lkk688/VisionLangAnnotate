@@ -17,6 +17,8 @@ from modeling_yolohf import (
     register_yolo_architecture,
     YoloConfig
 )
+# Create inverse mapping (COCO ID -> model index)
+inverse_coco_id_mapping = {v: k for k, v in original_coco_id_mapping.items()}
 
 class MultiModels:
     """
@@ -74,8 +76,15 @@ class MultiModels:
         # Initialize appropriate image processor based on model type
         self.processor = self._create_processor()
         
-        # COCO class names
-        self.class_names = coco_names
+        # class names
+        if self.config and hasattr(self.config, 'id2label'):
+            num_labels = len(self.config.id2label)
+            self.class_names = self.config.id2label
+        else: #81
+            self.class_names = coco_names
+            num_labels = len(self.class_names)
+        print(f"model has {num_labels} classes")
+        
         
         # Update model config with COCO class names if needed
         self._update_model_config_with_class_names()
@@ -145,6 +154,7 @@ class MultiModels:
             return YoloDetectionModel(cfg=config, device=self.device)
             
     def _load_from_hub(self, model_name):
+        from transformers import RTDetrImageProcessor, RTDetrV2ForObjectDetection
         """
         Load a model from Hugging Face Hub.
         
@@ -163,7 +173,10 @@ class MultiModels:
                 
             #from transformers import AutoModelForObjectDetection
             print(f"Loading model from Hugging Face Hub: {model_name}")
-            model = AutoModelForObjectDetection.from_pretrained(model_name)
+            if 'rt-detr' in model_name.lower():
+                model = RTDetrV2ForObjectDetection.from_pretrained(model_name)
+            else:
+                model = AutoModelForObjectDetection.from_pretrained(model_name)
             
             # Update model's config with COCO class names if needed
             if hasattr(model, 'config') and hasattr(model.config, 'id2label'):
@@ -580,9 +593,6 @@ class MultiModels:
         # Initialize results
         results = []
         
-        # Store image ID mapping for consistent IDs between GT and detections
-        self.image_id_map = {}
-        
         # Progress bar
         pbar = tqdm(dataloader, desc=f"Running inference for {output_format.upper()} evaluation")
         
@@ -592,35 +602,10 @@ class MultiModels:
                 if isinstance(batch, dict):
                     # Dictionary format
                     batch_images = batch.get('img', batch.get('pixel_values', batch.get('images'))) #[4, 3, 640, 640]
-                    
-                    # Store original images for visualization if not already present
-                    if visualize and 'img_orig' not in batch and isinstance(batch_images, torch.Tensor):
-                        # Convert tensor back to numpy for visualization
-                        if batch_images.dim() == 4:  # batch of images
-                            batch['img_orig'] = [img.permute(1, 2, 0).cpu().numpy() for img in batch_images]
-                        elif batch_images.dim() == 3:  # single image
-                            batch['img_orig'] = [batch_images.permute(1, 2, 0).cpu().numpy()]
-                            
+                    #[4, 3, 640, 640]
                     if isinstance(batch_images, list):
-                         # Store original images before processing
-                        if visualize and 'img_orig' not in batch:
-                            batch['img_orig'] = batch_images.copy()
-                        # Process images with processor if they're not tensors
                         inputs = self.processor(images=batch_images, return_tensors="pt")
                         batch_images = inputs["pixel_values"]
-                elif isinstance(batch, (list, tuple)) and len(batch) >= 2:
-                    # Tuple/list format (images, targets)
-                    batch_images = batch[0]
-                    if isinstance(batch[1], dict):
-                        batch = batch[1]
-                        batch['img'] = batch_images
-                        
-                        # Store original images for visualization
-                        if visualize and 'img_orig' not in batch and isinstance(batch_images, torch.Tensor):
-                            if batch_images.dim() == 4:  # batch of images
-                                batch['img_orig'] = [img.permute(1, 2, 0).cpu().numpy() for img in batch_images]
-                            elif batch_images.dim() == 3:  # single image
-                                batch['img_orig'] = [batch_images.permute(1, 2, 0).cpu().numpy()]
                 else:
                     print(f"Warning: Unsupported batch format: {type(batch)}")
                     continue
@@ -634,7 +619,7 @@ class MultiModels:
                 
                 # Run inference based on model type
                 try:
-                    if self.model_type == 'yolov8':
+                    if "yolo" in self.model_type:
                         # YOLO models expect pixel_values and have postprocess parameter
                         outputs = self.model(
                             pixel_values=batch_images, #[4, 3, 640, 640]
@@ -669,13 +654,8 @@ class MultiModels:
                 
                 # Process each image in the batch
                 for i, (output, img_id) in enumerate(zip(outputs, batch_image_ids)):
-                    # # Get image size if available
-                    # if isinstance(batch, dict) and 'orig_size' in batch:
-                    #     img_h, img_w = batch['orig_size'][i] if isinstance(batch['orig_size'], list) else batch['orig_size']
-                    # else:
-                    #     # Use default size if not provided
-                    #     img_h, img_w = batch_images.shape[2:] if len(batch_images.shape) == 4 else (batch_images.shape[1], batch_images.shape[2])
                     img_h, img_w=batch['target'][i]['orig_size']
+                    numeric_img_id = int(img_id)
                     # Handle different output formats
                     if isinstance(output, dict):
                         # Standard format with boxes, scores, labels
@@ -697,190 +677,101 @@ class MultiModels:
                     if isinstance(pred_labels, torch.Tensor):
                         pred_labels = pred_labels.cpu().numpy()
                     
-                    # Store consistent image ID mapping
-                    if isinstance(img_id, str):
-                        # Convert string IDs to integers for COCO
-                        if img_id not in self.image_id_map:
-                            self.image_id_map[img_id] = len(self.image_id_map)
-                        numeric_img_id = self.image_id_map[img_id]
-                    else:
-                        numeric_img_id = int(img_id)
+                    # Convert each detection to COCO format
+                    for box_idx in range(len(pred_boxes)):
+                        x1, y1, x2, y2 = pred_boxes[box_idx]
                         
-                    # Process detections based on output format
-                    if output_format == 'coco':
-                        # Convert each detection to COCO format
-                        for box_idx in range(len(pred_boxes)):
-                            x1, y1, x2, y2 = pred_boxes[box_idx]
-                            
-                            # COCO format uses [x, y, width, height]
-                            coco_box = [
-                                float(x1),
-                                float(y1),
-                                float(x2 - x1),
-                                float(y2 - y1)
-                            ]
-                            
-                            # Get category ID, handling both string and integer labels
-                            label = pred_labels[box_idx]
-                            if isinstance(label, (str, np.str_)):
-                                # Try to convert string label to integer
-                                if hasattr(self.model, 'config') and hasattr(self.model.config, 'label2id'):
-                                    category_id = int(self.model.config.label2id.get(label, 0))
-                                else:
-                                    # Default to 0 if can't convert
-                                    category_id = 0
+                        # COCO format uses [x, y, width, height]
+                        coco_box = [
+                            float(x1),
+                            float(y1),
+                            float(x2 - x1),
+                            float(y2 - y1)
+                        ]
+                        
+                        # Get category ID, handling both string and integer labels
+                        label = pred_labels[box_idx] #np.int64(62)
+                        if isinstance(label, (str, np.str_)):
+                            # Try to convert string label to integer
+                            if hasattr(self.model, 'config') and hasattr(self.model.config, 'label2id'):
+                                category_id = int(self.model.config.label2id.get(label, 0))
                             else:
-                                category_id = int(label)
-                            
-                            # Map model's continuous category IDs to COCO's non-continuous IDs
-                            # COCO uses specific IDs that aren't sequential
-                            
-                            # Create detection entry
-                            # detection = {
-                            #     'image_id': int(img_id) if not isinstance(img_id, str) else hash(img_id) % 10000,
-                            #     'category_id': category_id,
-                            #     'bbox': coco_box,
-                            #     'score': float(pred_scores[box_idx]),
-                            #     'area': float((x2 - x1) * (y2 - y1)),
-                            #     'iscrowd': 0
-                            # }
-                            # Use the mapping if available, otherwise add 1 (0->1, 1->2, etc.)
-                            if category_id in original_coco_id_mapping:
-                                mapped_category_id = original_coco_id_mapping[category_id]
-                            else:
-                                # Fallback to simple +1 mapping for categories not in the mapping
-                                mapped_category_id = category_id + 1
-                            detection = {
-                                'image_id': numeric_img_id,
-                                'category_id': mapped_category_id,
-                                'bbox': coco_box,
-                                'score': float(pred_scores[box_idx]),
-                                'area': float((x2 - x1) * (y2 - y1)),
-                                'iscrowd': 0
-                            }
-                            
-                            results.append(detection)
-                    
-                    elif output_format == 'kitti':
-                        # Convert each detection to KITTI format
-                        image_results = []
-                        
-                        for box_idx in range(len(pred_boxes)):
-                            x1, y1, x2, y2 = pred_boxes[box_idx]
-                            
-                            # Get category ID and map to KITTI class
-                            label = pred_labels[box_idx]
-                            if isinstance(label, (str, np.str_)):
-                                # Try to convert string label to integer
-                                if hasattr(self.model, 'config') and hasattr(self.model.config, 'label2id'):
-                                    category_id = int(self.model.config.label2id.get(label, 0))
-                                else:
-                                    # Default to 0 if can't convert
-                                    category_id = 0
-                            else:
-                                category_id = int(label)
-                            
-                            # Map COCO class ID to KITTI class name
-                            coco_to_kitti = {
-                                0: 'Pedestrian',  # person
-                                1: 'Cyclist',     # bicycle
-                                2: 'Car',         # car
-                                3: 'Cyclist',     # motorcycle
-                                5: 'Car',         # bus
-                                7: 'Truck',       # truck
-                                9: 'Misc'         # traffic light
-                            }
-                            
-                            kitti_class = coco_to_kitti.get(category_id, 'DontCare')
-                            
-                            # Skip classes that don't map to KITTI
-                            if kitti_class == 'DontCare' and pred_scores[box_idx] < 0.5:
-                                continue
-                            
-                            # Format: type truncated occluded alpha x1 y1 x2 y2 h w l x y z rotation_y score
-                            kitti_line = f"{kitti_class} 0.0 0 0.0 {x1:.2f} {y1:.2f} {x2:.2f} {y2:.2f} 0.0 0.0 0.0 0.0 0.0 0.0 {pred_scores[box_idx]:.6f}"
-                            image_results.append(kitti_line)
-                        
-                        # Add to results
-                        # results.append({
-                        #     'image_id': img_id,
-                        #     'detections': image_results
-                        # })
-                        
-                        # Add to results with consistent image ID
-                        results.append({
-                            'image_id': numeric_img_id,
-                            'original_id': img_id,  # Keep original ID for file naming
-                            'detections': image_results
-                        })
-                        
-                        # Save detections to file if output directory is provided
-                        if output_dir:
-                            # Use original ID for file naming
-                            result_file = os.path.join(output_dir, f"{img_id}.txt")
-                            with open(result_file, 'w') as f:
-                                for line in image_results:
-                                    f.write(line + '\n')
-                    
-                    # Visualize if output directory is provided
-                    if visualize and output_dir and batch_idx % 10 == 0 and i == 0:  # Visualize every 10th batch, first image
-                        # Try to get original image for visualization
-                        if isinstance(batch, dict) and 'img_orig' in batch:
-                            #img_orig = batch['img_orig'][i]
-                            img_orig = batch['img_orig'][i] if isinstance(batch['img_orig'], list) else batch['img_orig']
-                            
-                            # Convert tensor to numpy if needed
-                            if isinstance(img_orig, torch.Tensor):
-                                img_orig = img_orig.permute(1, 2, 0).cpu().numpy()
-                                
-                            # Convert normalized image to uint8 if needed
-                            if img_orig.dtype == np.float32 and img_orig.max() <= 1.0:
-                                img_orig = (img_orig * 255).astype(np.uint8)
-                                
-                            # Convert RGB to BGR for OpenCV if needed
-                            if img_orig.shape[2] == 3:  # RGB image
-                                img_orig = cv2.cvtColor(img_orig, cv2.COLOR_RGB2BGR)
-                                
-                        elif isinstance(batch, dict) and 'img_path' in batch:
-                            try:
-                                img_path = batch['img_path'][i] if isinstance(batch['img_path'], list) else batch['img_path']
-                                img_orig = cv2.imread(img_path)
-                            except:
-                                img_orig = None
+                                # Default to 0 if can't convert
+                                category_id = 0
                         else:
-                            # Try to reconstruct from processed tensor
-                            try:
-                                if isinstance(batch_images, torch.Tensor) and batch_images.dim() == 4:
-                                    img = batch_images[i].permute(1, 2, 0).cpu().numpy()
-                                    img_orig = (img * 255).astype(np.uint8)
-                                    if img_orig.shape[2] == 3:  # RGB image
-                                        img_orig = cv2.cvtColor(img_orig, cv2.COLOR_RGB2BGR)
-                                else:
-                                    img_orig = None
-                            except:
-                                img_orig = None
+                            category_id = int(label)
                         
-                        if img_orig is not None:
-                            # Create visualization
-                            vis_result = {
-                                'boxes': pred_boxes,
-                                'scores': pred_scores,
-                                'labels': pred_labels
-                            }
-                            
-                            # Visualize detections
-                            img_path = self.dataset.image_id_to_path[int(img_id)]
-                            img = cv2.imread(img_path)
-                            img_orig = cv2.cvtColor(img, cv2.COLOR_RGB2BGR) #HWC
-                            self._visualize_detections_metrics(
-                                image = img_orig,
-                                detections=vis_result,
-                                ground_truth=batch['target'][i],
-                                output_path=os.path.join(output_dir, "visualize_detections_metrics", f"vis_{img_id}.jpg")
-                            )
-        
+                        # Use the mapping if available, otherwise add 1 (0->1, 1->2, etc.)
+                        if category_id in original_coco_id_mapping:
+                            mapped_category_id = original_coco_id_mapping[category_id]
+                        else:
+                            # Fallback to simple +1 mapping for categories not in the mapping
+                            mapped_category_id = category_id + 1
+                        detection = {
+                            'image_id': numeric_img_id,
+                            'category_id': mapped_category_id,
+                            'bbox': coco_box, #[x, y, width, height]
+                            'score': float(pred_scores[box_idx]),
+                            'area': float((x2 - x1) * (y2 - y1)),
+                            'iscrowd': 0
+                        }
+                        
+                        results.append(detection)
+                #vis the batch
+                if output_dir and batch_idx % 10 == 0: 
+                    self.vis_batch_inferenceresults(batch=batch, i=i, img_id=img_id, \
+                        pred_boxes=pred_boxes, pred_scores=pred_scores, pred_labels=pred_labels, output_dir=output_dir)
         return results
     
+    def vis_batch_inferenceresults(self, batch, i, img_id, \
+        pred_boxes, pred_scores, pred_labels, output_dir):
+        # Try to get original image for visualization
+        img_id = int(img_id)
+        if hasattr(self.dataset, 'image_id_to_path') and img_id in self.dataset.image_id_to_path:
+            img_path = self.dataset.image_id_to_path[int(img_id)]
+            img = cv2.imread(img_path)
+            img_orig = cv2.cvtColor(img, cv2.COLOR_RGB2BGR) #HWC (500, 375, 3)
+        elif isinstance(batch, dict) and 'img_orig' in batch:
+            #img_orig = batch['img_orig'][i]
+            img_orig = batch['img_orig'][i] if isinstance(batch['img_orig'], list) else batch['img_orig']
+            
+            # Convert tensor to numpy if needed
+            if isinstance(img_orig, torch.Tensor):
+                img_orig = img_orig.permute(1, 2, 0).cpu().numpy()
+                
+            # Convert normalized image to uint8 if needed
+            if img_orig.dtype == np.float32 and img_orig.max() <= 1.0:
+                img_orig = (img_orig * 255).astype(np.uint8)
+                
+            # Convert RGB to BGR for OpenCV if needed
+            if img_orig.shape[2] == 3:  # RGB image
+                img_orig = cv2.cvtColor(img_orig, cv2.COLOR_RGB2BGR)
+                
+        elif isinstance(batch, dict) and 'img_path' in batch:
+            try:
+                img_path = batch['img_path'][i] if isinstance(batch['img_path'], list) else batch['img_path']
+                img_orig = cv2.imread(img_path)
+            except:
+                img_orig = None
+        else:
+            print("img_orig not available")
+        
+        if img_orig is not None:
+            # Create visualization
+            vis_result = {
+                'boxes': pred_boxes, #x1, y1, x2, y2 format
+                'scores': pred_scores,
+                'labels': pred_labels
+            }
+            
+            # Visualize detections
+            self._visualize_detections_metrics(
+                image = img_orig,
+                detections=vis_result,
+                ground_truth=batch['target'][i],
+                output_path=os.path.join(output_dir, "visualize_detections_metrics", f"vis_{img_id}.jpg")
+            )
+
     def _convert_dataset_to_coco(self, dataset):
         """
         Convert a generic dataset to COCO format.
@@ -1119,7 +1010,7 @@ class MultiModels:
                 img = np.ones((height, width, 3), dtype=np.uint8) * 255
         
         # Get image dimensions
-        height, width = img.shape[:2]
+        height, width = img.shape[:2] #(480, 640, 3)
         
         # Define colors for different categories and status
         # Ground truth: Green
@@ -1141,8 +1032,10 @@ class MultiModels:
                     cv2.rectangle(img, (x1, y1), (x2, y2), gt_color, 2)
                     
                     # Get category name
-                    cat_name = self.class_names.get(cat_id, f"class_{cat_id}")
-                    
+                    #map from the original coco id to the modified coco 80 class id
+                    #coco80classcat_id = inverse_coco_id_mapping[cat_id]
+                    # Handle case where cat_id is not in the mapping
+                    cat_name = self._get_category_name(cat_id)
                     # Draw label
                     cv2.putText(img, f"GT: {cat_name}", (x1, y1 - 10), 
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, gt_color, 2)
@@ -1162,8 +1055,8 @@ class MultiModels:
                     cv2.rectangle(img, (x1, y1), (x2, y2), color, 2)
                     
                     # Get category name
-                    cat_name = self.class_names.get(cat_id, f"class_{cat_id}")
-                    
+                    # Handle case where cat_id is not in the mapping
+                    cat_name = self._get_category_name(cat_id)
                     # Draw label with score
                     label = f"TP: {cat_name}" if pred['matched'] else f"FP: {cat_name}"
                     score_text = f"{pred['score']:.2f}"
@@ -1216,6 +1109,354 @@ class MultiModels:
         
         return vis_path
 
+    def visualize_analytics(self, analytics, output_path=None):
+        """
+        Visualize detection analytics results with multiple plots.
+        
+        Args:
+            analytics: Dictionary containing detection analytics
+            output_path: Path to save the PDF file (default: 'detection_analytics.pdf')
+        
+        Returns:
+            Path to the saved PDF file
+        """
+        import matplotlib.pyplot as plt
+        from matplotlib.backends.backend_pdf import PdfPages
+        import matplotlib.gridspec as gridspec
+        import numpy as np
+        import os
+        from PIL import Image
+        
+        if output_path is None:
+            output_path = 'detection_analytics.pdf'
+        
+        # Create a temporary directory for example images
+        temp_dir = os.path.join(os.path.dirname(output_path), 'temp_examples')
+        os.makedirs(temp_dir, exist_ok=True)
+
+        # Create PDF with multiple pages
+        with PdfPages(output_path) as pdf:
+            # Page 1: False Positive Analysis
+            plt.figure(figsize=(12, 10))
+            plt.suptitle('Detection Error Analysis', fontsize=16)
+            
+            # Plot 1: False Positive Confidence Distribution
+            plt.subplot(2, 1, 1)
+            fp_conf = analytics['fp_confidence_distribution']
+            conf_ranges = list(fp_conf.keys())
+            fp_counts = list(fp_conf.values())
+            
+            # Create bar chart
+            bars = plt.bar(conf_ranges, fp_counts, color='salmon')
+            plt.title('False Positive Distribution by Confidence Score')
+            plt.xlabel('Confidence Score Range')
+            plt.ylabel('Number of False Positives')
+            plt.xticks(rotation=45)
+            
+            # Add value labels on top of bars
+            for bar in bars:
+                height = bar.get_height()
+                plt.text(bar.get_x() + bar.get_width()/2., height + 0.1,
+                        f'{int(height)}', ha='center', va='bottom')
+            
+            # Plot 2: False Negative Size Distribution
+            plt.subplot(2, 1, 2)
+            fn_sizes = analytics['fn_size_distribution']
+            sizes = list(fn_sizes.keys())
+            fn_counts = list(fn_sizes.values())
+            
+            # Create bar chart with different colors for each size
+            size_colors = {'small': 'lightcoral', 'medium': 'indianred', 'large': 'darkred'}
+            bars = plt.bar(sizes, fn_counts, color=[size_colors[s] for s in sizes])
+            plt.title('False Negative Distribution by Object Size')
+            plt.xlabel('Object Size')
+            plt.ylabel('Number of False Negatives')
+            
+            # Add value labels on top of bars
+            for bar in bars:
+                height = bar.get_height()
+                plt.text(bar.get_x() + bar.get_width()/2., height + 0.1,
+                        f'{int(height)}', ha='center', va='bottom')
+            
+            plt.tight_layout(rect=[0, 0, 1, 0.95])
+            pdf.savefig()
+            plt.close()
+            
+            # Page 2: Category Analysis
+            plt.figure(figsize=(12, 10))
+            plt.suptitle('Category Performance Analysis', fontsize=16)
+            
+            # Plot 1: Top Categories with False Positives
+            plt.subplot(2, 1, 1)
+            # Get top 10 categories with most false positives
+            top_fp = analytics['top_fp_categories'][:10]
+            cat_names = [f"{name} ({cat_id})" for cat_id, name, _ in top_fp]
+            fp_counts = [count for _, _, count in top_fp]
+            
+            # Create horizontal bar chart
+            bars = plt.barh(cat_names, fp_counts, color='lightcoral')
+            plt.title('Top 10 Categories with Most False Positives')
+            plt.xlabel('Number of False Positives')
+            plt.gca().invert_yaxis()  # Highest count at the top
+            
+            # Add value labels
+            for bar in bars:
+                width = bar.get_width()
+                plt.text(width + 0.5, bar.get_y() + bar.get_height()/2.,
+                        f'{int(width)}', ha='left', va='center')
+            
+            # Plot 2: Top Categories with False Negatives
+            plt.subplot(2, 1, 2)
+            # Get top 10 categories with most false negatives
+            top_fn = analytics['top_fn_categories'][:10]
+            cat_names = [f"{name} ({cat_id})" for cat_id, name, _ in top_fn]
+            fn_counts = [count for _, _, count in top_fn]
+            
+            # Create horizontal bar chart
+            bars = plt.barh(cat_names, fn_counts, color='steelblue')
+            plt.title('Top 10 Categories with Most False Negatives')
+            plt.xlabel('Number of False Negatives')
+            plt.gca().invert_yaxis()  # Highest count at the top
+            
+            # Add value labels
+            for bar in bars:
+                width = bar.get_width()
+                plt.text(width + 0.5, bar.get_y() + bar.get_height()/2.,
+                        f'{int(width)}', ha='left', va='center')
+            
+            plt.tight_layout(rect=[0, 0, 1, 0.95])
+            pdf.savefig()
+            plt.close()
+            
+            # Page 3: Precision-Recall Analysis
+            plt.figure(figsize=(12, 10))
+            plt.suptitle('Precision-Recall Analysis', fontsize=16)
+            
+            # Plot 1: Worst Performing Images
+            plt.subplot(2, 1, 1)
+            worst_imgs = analytics['worst_images'][:15]  # Top 15 worst images
+            img_ids = [str(img_id) for img_id, _, _ in worst_imgs]
+            precisions = [prec for _, prec, _ in worst_imgs]
+            recalls = [rec for _, _, rec in worst_imgs]
+            
+            # Create a scatter plot
+            plt.scatter(recalls, precisions, c='red', alpha=0.7)
+            
+            # Add image IDs as labels
+            for i, img_id in enumerate(img_ids):
+                plt.annotate(img_id, (recalls[i], precisions[i]), 
+                            textcoords="offset points", xytext=(0,5), ha='center')
+            
+            plt.title('Worst Performing Images (Precision vs Recall)')
+            plt.xlabel('Recall')
+            plt.ylabel('Precision')
+            plt.xlim(-0.05, 1.05)
+            plt.ylim(-0.05, 1.05)
+            plt.grid(True, linestyle='--', alpha=0.7)
+            
+            # Plot 2: Confidence Threshold Analysis
+            plt.subplot(2, 1, 2)
+            
+            # Get optimal threshold info
+            opt_threshold = analytics['optimal_confidence_threshold']
+            threshold = opt_threshold['threshold']
+            best_precision = opt_threshold['precision']
+            
+            # Create a line to show current vs optimal threshold
+            current_threshold = 0.25  # Default threshold used in evaluation
+            thresholds = np.arange(0.25, 1.0, 0.05)
+            
+            # Extract TP and FP counts for each threshold from analytics
+            # This is a simplified version - in practice, you'd need the full data
+            # Here we're just showing the optimal point
+            plt.axvline(x=current_threshold, color='blue', linestyle='--', 
+                       label=f'Current Threshold ({current_threshold})')
+            plt.axvline(x=threshold, color='green', linestyle='--', 
+                       label=f'Optimal Threshold ({threshold:.2f})')
+            
+            plt.scatter([threshold], [best_precision], color='green', s=100, zorder=5)
+            plt.annotate(f'Precision: {best_precision:.4f}', 
+                        (threshold, best_precision),
+                        textcoords="offset points", xytext=(10,0))
+            
+            plt.title('Confidence Threshold Analysis')
+            plt.xlabel('Confidence Threshold')
+            plt.ylabel('Precision')
+            plt.xlim(0.2, 1.0)
+            plt.ylim(0, 1.05)
+            plt.grid(True, linestyle='--', alpha=0.7)
+            plt.legend()
+            
+            plt.tight_layout(rect=[0, 0, 1, 0.95])
+            pdf.savefig()
+            plt.close()
+            
+            # Page 4: Category Performance Heatmap
+            plt.figure(figsize=(12, 10))
+            plt.suptitle('Category Performance Metrics', fontsize=16)
+            
+            # Get category problems data
+            cat_problems = analytics['category_problems']
+            
+            # Sort by number of instances (TP + FP + FN)
+            cat_problems = sorted(cat_problems, 
+                                 key=lambda x: x['false_positives'] + x['false_negatives'], 
+                                 reverse=True)
+            
+            # Take top 15 categories with most instances
+            top_cats = cat_problems[:15]
+            
+            # Create data for heatmap
+            cat_names = [f"{c['name']} ({c['category_id']})" for c in top_cats]
+            metrics = ['precision', 'recall', 'ap']
+            data = np.zeros((len(cat_names), len(metrics)))
+            
+            for i, cat in enumerate(top_cats):
+                data[i, 0] = cat['precision']
+                data[i, 1] = cat['recall']
+                data[i, 2] = cat['ap']
+            
+            # Create heatmap
+            plt.subplot(1, 1, 1)
+            im = plt.imshow(data, cmap='RdYlGn', aspect='auto', vmin=0, vmax=1)
+            
+            # Add colorbar
+            cbar = plt.colorbar(im)
+            cbar.set_label('Score (0-1)')
+            
+            # Add labels
+            plt.yticks(range(len(cat_names)), cat_names)
+            plt.xticks(range(len(metrics)), ['Precision', 'Recall', 'AP'])
+            
+            # Add text annotations
+            for i in range(len(cat_names)):
+                for j in range(len(metrics)):
+                    text = plt.text(j, i, f'{data[i, j]:.2f}',
+                                   ha="center", va="center", color="black")
+            
+            plt.title('Performance Metrics by Category')
+            plt.tight_layout(rect=[0, 0, 1, 0.95])
+            pdf.savefig()
+            plt.close()
+
+            # NEW: Add pages with example images
+            # Get worst performing images
+            worst_imgs = analytics['worst_images'][:10]  # Top 10 worst images
+            
+            # Get best performing images (with at least 10 GT objects)
+            # We need to extract this from per_image_metrics
+            per_image_metrics = analytics.get('per_image_metrics', {})
+            
+            # Filter images with at least 10 GT objects
+            images_with_many_objects = []
+            for img_id, metrics in per_image_metrics.items():
+                if metrics.get('gt_count', 0) >= 10:
+                    # Calculate F1 score for ranking
+                    precision = metrics.get('precision', 0)
+                    recall = metrics.get('recall', 0)
+                    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0
+                    images_with_many_objects.append((img_id, precision, recall, f1))
+            
+            # Sort by F1 score (descending)
+            images_with_many_objects.sort(key=lambda x: x[3], reverse=True)
+            best_imgs = images_with_many_objects[:10]  # Top 10 best images
+            
+            # Debug information
+            print(f"Found {len(images_with_many_objects)} images with ≥10 GT objects")
+            print(f"Selected top {len(best_imgs)} best performing images")
+
+            # Generate example visualizations for worst performing images
+            print("Generating visualizations for worst performing images...")
+            worst_img_paths = []
+            for img_id, precision, recall in worst_imgs:
+                # Create visualization using _visualize_evaluation_results
+                vis_path = self._visualize_evaluation_results(
+                    img_id=img_id,
+                    gt_by_img=analytics.get('gt_by_img', {}),
+                    pred_by_img=analytics.get('pred_by_img', {}),
+                    img_metrics=per_image_metrics.get(img_id, {}),
+                    output_dir=temp_dir
+                )
+                if vis_path and os.path.exists(vis_path):
+                    worst_img_paths.append((img_id, precision, recall, vis_path))
+            
+            # Generate example visualizations for best performing images
+            print("Generating visualizations for best performing images...")
+            best_img_paths = []
+            for img_id, precision, recall, _ in best_imgs:
+                # Create visualization using _visualize_evaluation_results
+                vis_path = self._visualize_evaluation_results(
+                    img_id=img_id,
+                    gt_by_img=analytics.get('gt_by_img', {}),
+                    pred_by_img=analytics.get('pred_by_img', {}),
+                    img_metrics=per_image_metrics.get(img_id, {}),
+                    output_dir=temp_dir
+                )
+                if vis_path and os.path.exists(vis_path):
+                    best_img_paths.append((img_id, precision, recall, vis_path))
+            
+            print(f"Generated {len(worst_img_paths)} worst image visualizations")
+            print(f"Generated {len(best_img_paths)} best image visualizations")
+
+            # Add worst performing images to PDF
+            if worst_img_paths:
+                plt.figure(figsize=(12, 10))
+                plt.suptitle('Worst Performing Images', fontsize=16)
+                
+                # Create a grid for the images
+                rows = min(5, len(worst_img_paths))
+                cols = min(2, (len(worst_img_paths) + rows - 1) // rows)
+                
+                for i, (img_id, precision, recall, img_path) in enumerate(worst_img_paths):
+                    if i >= rows * cols:
+                        break
+                        
+                    # Add subplot
+                    plt.subplot(rows, cols, i + 1)
+                    
+                    # Load and display image
+                    img = Image.open(img_path)
+                    plt.imshow(np.array(img))
+                    
+                    # Add title with metrics
+                    plt.title(f"ID: {img_id}, Precision: {precision:.2f}, Recall: {recall:.2f}")
+                    plt.axis('off')
+                
+                plt.tight_layout(rect=[0, 0, 1, 0.95])
+                pdf.savefig()
+                plt.close()
+            
+            # Add best performing images to PDF
+            if best_img_paths:
+                plt.figure(figsize=(12, 10))
+                plt.suptitle('Best Performing Images (≥10 GT Objects)', fontsize=16)
+                
+                # Create a grid for the images
+                rows = min(5, len(best_img_paths))
+                cols = min(2, (len(best_img_paths) + rows - 1) // rows)
+                
+                for i, (img_id, precision, recall, img_path) in enumerate(best_img_paths):
+                    if i >= rows * cols:
+                        break
+                        
+                    # Add subplot
+                    plt.subplot(rows, cols, i + 1)
+                    
+                    # Load and display image
+                    img = Image.open(img_path)
+                    plt.imshow(np.array(img))
+                    
+                    # Add title with metrics
+                    plt.title(f"ID: {img_id}, Precision: {precision:.2f}, Recall: {recall:.2f}")
+                    plt.axis('off')
+                
+                plt.tight_layout(rect=[0, 0, 1, 0.95])
+                pdf.savefig()
+                plt.close()
+        
+        print(f"Analytics visualization saved to {output_path}")
+        return output_path
+
     def _run_custom_evaluation(self, coco_gt, coco_results, output_dir=None, iou_thres=0.5):
         """
         Run custom evaluation on detections with per-image metrics.
@@ -1255,9 +1496,10 @@ class MultiModels:
             }
         
         # Get all category IDs
-        gt_cat_ids = set(coco_gt.getCatIds())
-        result_cat_ids = set(r['category_id'] for r in valid_results)
-        all_cat_ids = sorted(gt_cat_ids.union(result_cat_ids))
+        gt_cat_ids = set(coco_gt.getCatIds()) #1-90 len=80
+        #r['category_id'] is original COCO id in 0-90
+        result_cat_ids = set(r['category_id'] for r in valid_results) ##1-90 len=80
+        all_cat_ids = sorted(gt_cat_ids.union(result_cat_ids)) #1-90 len=80
         
         # Group ground truth by image and category
         gt_by_img = {} #[img_id][cat_id]
@@ -1332,8 +1574,9 @@ class MultiModels:
         # Calculate per-category metrics
         category_metrics = {cat_id: {'TP': 0, 'FP': 0, 'FN': 0, 'AP': 0.0} for cat_id in all_cat_ids}
         
-        # Process each image
-        for img_id in gt_img_ids:
+        # Process each image with progress bar
+        print(f"Processing {len(gt_img_ids)} images for evaluation...")
+        for img_id in tqdm(gt_img_ids, desc="Evaluating images", unit="img"):
             # Initialize per-image metrics
             per_image_metrics[img_id] = {
                 'correct': 0,
@@ -1513,6 +1756,7 @@ class MultiModels:
         mean_ap = sum(cat_metrics['AP'] for cat_metrics in category_metrics.values()) / len(category_metrics) if category_metrics else 0.0
         
         # Prepare summary metrics
+        # Prepare summary metrics
         summary_metrics = {
             'mAP': mean_ap,
             'precision': overall_precision,
@@ -1528,7 +1772,10 @@ class MultiModels:
                 'FP': metrics['FP'],
                 'FN': metrics['FN']
             } for cat_id, metrics in category_metrics.items()},
-            'per_image': per_image_metrics
+            'per_image': per_image_metrics,
+            # Store ground truth and prediction data for visualization
+            'gt_by_img': gt_by_img,
+            'pred_by_img': pred_by_img
         }
         
         # Print summary
@@ -1538,10 +1785,46 @@ class MultiModels:
         print(f"Recall: {overall_recall:.4f}")
         print(f"Correct Detections: {total_correct} / {total_pred} predictions, {total_gt} ground truths")
         
+        # Add analytics to identify major problems
+        analytics = self._analyze_detection_problems(
+            gt_by_img, pred_by_img, per_image_metrics, category_metrics, all_cat_ids
+        )
+        # Add necessary data to analytics for visualization
+        analytics['gt_by_img'] = gt_by_img
+        analytics['pred_by_img'] = pred_by_img
+        analytics['per_image_metrics'] = per_image_metrics
+        summary_metrics['analytics'] = analytics
+        
+        # Print analytics insights
+        print("\n===== Detection Problem Analysis =====")
+        print(f"Top problematic categories (highest false positives):")
+        for cat_id, cat_name, fp_count in analytics['top_fp_categories'][:5]:
+            print(f"  {cat_name} (ID: {cat_id}): {fp_count} false positives")
+        
+        print("\nTop problematic categories (highest false negatives):")
+        for cat_id, cat_name, fn_count in analytics['top_fn_categories'][:5]:
+            print(f"  {cat_name} (ID: {cat_id}): {fn_count} false negatives")
+        
+        print("\nFalse positive confidence distribution:")
+        for conf_range, count in analytics['fp_confidence_distribution'].items():
+            print(f"  {conf_range}: {count} detections")
+        
+        print("\nWorst performing images:")
+        for img_id, precision, recall in analytics['worst_images'][:5]:
+            print(f"  Image ID {img_id}: Precision={precision:.4f}, Recall={recall:.4f}")
+
+        # Visualize analytics if output directory is provided
+        if output_dir:
+            analytics_pdf = os.path.join(output_dir, "detection_analytics.pdf")
+            self.visualize_analytics(analytics, output_path=analytics_pdf)
+            print(f"\nAnalytics visualization saved to {analytics_pdf}")
+
         # Print per-category results
         print("\nPer-Category Results:")
         for cat_id in sorted(category_metrics.keys()):
-            cat_name = self.class_names.get(cat_id, f"class_{cat_id}")
+            # Handle case where cat_id is not in the mapping
+            cat_name = self._get_category_name(cat_id)
+            #cat_name = self.class_names.get(coco80classcat_id, f"class_{coco80classcat_id}")
             metrics = category_metrics[cat_id]
             cat_precision = metrics['TP'] / (metrics['TP'] + metrics['FP']) if (metrics['TP'] + metrics['FP']) > 0 else 0.0
             cat_recall = metrics['TP'] / (metrics['TP'] + metrics['FN']) if (metrics['TP'] + metrics['FN']) > 0 else 0.0
@@ -1555,6 +1838,197 @@ class MultiModels:
             print(f"\nCustom evaluation results saved to {output_dir}/custom_eval_results.json")
         
         return summary_metrics
+
+    def _get_category_name(self, cat_id, model_type=None):
+        """
+        Get category name from category ID, handling different model indexing schemes.
+        
+        Args:
+            cat_id: Category ID
+            model_type: Type of model ('detr', 'yolov8', etc.)
+            
+        Returns:
+            Category name
+        """
+        #The COCO dataset has 80 categories with IDs ranging from 1-90 (with some gaps), 
+        # but DETR might be using a continuous 0-91 indexing or some other scheme.
+        # For DETR models, which might use a different indexing scheme
+        if 'detr' in self.model_type.lower():
+            # If the model has its own category mapping, use that
+            if hasattr(self.model, 'config') and hasattr(self.model.config, 'id2label'):
+                return self.model.config.id2label.get(cat_id, f"class_{cat_id}")
+        
+        # For standard COCO models
+        try:
+            # Try to map to standard COCO 80-class index
+            coco80classcat_id = inverse_coco_id_mapping.get(cat_id, cat_id)
+            return self.class_names.get(coco80classcat_id, f"class_{cat_id}")
+        except:
+            # Fallback for any other case
+            return f"class_{cat_id}"
+
+    def _analyze_detection_problems(self, gt_by_img, pred_by_img, per_image_metrics, 
+                                   category_metrics, all_cat_ids):
+        """
+        Analyze detection results to identify major problems.
+        
+        Args:
+            gt_by_img: Ground truth annotations by image ID and category
+            pred_by_img: Predictions by image ID and category
+            per_image_metrics: Metrics calculated per image
+            category_metrics: Metrics calculated per category
+            all_cat_ids: All category IDs in the dataset
+            
+        Returns:
+            Dictionary with analytics results
+        """
+        analytics = {}
+        
+        # 1. Analyze false positives by confidence score
+        fp_by_confidence = {
+            '0.90-1.00': 0,
+            '0.80-0.90': 0,
+            '0.70-0.80': 0,
+            '0.60-0.70': 0,
+            '0.50-0.60': 0,
+            '0.40-0.50': 0,
+            '0.30-0.40': 0,
+            '0.25-0.30': 0
+        }
+        
+        # Collect all false positives
+        for img_id in pred_by_img:
+            for cat_id in pred_by_img[img_id]:
+                for pred in pred_by_img[img_id][cat_id]:
+                    if not pred['matched']:  # False positive
+                        score = pred['score']
+                        if score >= 0.90:
+                            fp_by_confidence['0.90-1.00'] += 1
+                        elif score >= 0.80:
+                            fp_by_confidence['0.80-0.90'] += 1
+                        elif score >= 0.70:
+                            fp_by_confidence['0.70-0.80'] += 1
+                        elif score >= 0.60:
+                            fp_by_confidence['0.60-0.70'] += 1
+                        elif score >= 0.50:
+                            fp_by_confidence['0.50-0.60'] += 1
+                        elif score >= 0.40:
+                            fp_by_confidence['0.40-0.50'] += 1
+                        elif score >= 0.30:
+                            fp_by_confidence['0.30-0.40'] += 1
+                        elif score >= 0.25:
+                            fp_by_confidence['0.25-0.30'] += 1
+        
+        analytics['fp_confidence_distribution'] = fp_by_confidence
+        
+        # 2. Identify problematic categories (high FP or FN)
+        category_problems = []
+        for cat_id in all_cat_ids:
+            if cat_id in category_metrics:
+                metrics = category_metrics[cat_id]
+                # Map from original COCO ID to model index for class name lookup
+                coco80class_id = inverse_coco_id_mapping.get(cat_id, cat_id)
+                cat_name = self.class_names.get(coco80class_id, f"class_{coco80class_id}")
+                
+                category_problems.append({
+                    'category_id': cat_id,
+                    'name': cat_name,
+                    'false_positives': metrics['FP'],
+                    'false_negatives': metrics['FN'],
+                    'precision': metrics['TP'] / (metrics['TP'] + metrics['FP']) if (metrics['TP'] + metrics['FP']) > 0 else 0.0,
+                    'recall': metrics['TP'] / (metrics['TP'] + metrics['FN']) if (metrics['TP'] + metrics['FN']) > 0 else 0.0,
+                    'ap': metrics['AP']
+                })
+        
+        # Sort by false positives (descending)
+        top_fp_categories = [(c['category_id'], c['name'], c['false_positives']) 
+                            for c in sorted(category_problems, key=lambda x: x['false_positives'], reverse=True)
+                            if c['false_positives'] > 0]
+        
+        # Sort by false negatives (descending)
+        top_fn_categories = [(c['category_id'], c['name'], c['false_negatives']) 
+                            for c in sorted(category_problems, key=lambda x: x['false_negatives'], reverse=True)
+                            if c['false_negatives'] > 0]
+        
+        analytics['top_fp_categories'] = top_fp_categories
+        analytics['top_fn_categories'] = top_fn_categories
+        analytics['category_problems'] = category_problems
+        
+        # 3. Identify worst performing images
+        worst_images = []
+        for img_id, metrics in per_image_metrics.items():
+            # Skip images with no ground truth or predictions
+            if metrics['gt_count'] == 0 or metrics['pred_count'] == 0:
+                continue
+                
+            # Calculate F1 score
+            precision = metrics['precision']
+            recall = metrics['recall']
+            f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0
+            
+            worst_images.append((img_id, precision, recall, f1))
+        
+        # Sort by F1 score (ascending)
+        worst_images.sort(key=lambda x: x[3])
+        
+        # Keep only image ID, precision, and recall
+        analytics['worst_images'] = [(img_id, precision, recall) for img_id, precision, recall, _ in worst_images]
+        
+        # 4. Analyze size distribution of false negatives
+        # This requires bounding box dimensions
+        fn_size_distribution = {
+            'small': 0,   # area < 32^2
+            'medium': 0,  # 32^2 <= area < 96^2
+            'large': 0    # area >= 96^2
+        }
+        
+        for img_id in gt_by_img:
+            for cat_id in gt_by_img[img_id]:
+                for gt in gt_by_img[img_id][cat_id]:
+                    if not gt['matched']:  # False negative
+                        # Calculate area
+                        width, height = gt['bbox'][2], gt['bbox'][3]
+                        area = width * height
+                        
+                        if area < 32*32:
+                            fn_size_distribution['small'] += 1
+                        elif area < 96*96:
+                            fn_size_distribution['medium'] += 1
+                        else:
+                            fn_size_distribution['large'] += 1
+        
+        analytics['fn_size_distribution'] = fn_size_distribution
+        
+        # 5. Calculate potential improvement from confidence threshold adjustment
+        # Find optimal confidence threshold
+        thresholds = np.arange(0.25, 1.0, 0.05)
+        threshold_metrics = []
+        
+        for threshold in thresholds:
+            tp, fp = 0, 0
+            
+            for img_id in pred_by_img:
+                for cat_id in pred_by_img[img_id]:
+                    for pred in pred_by_img[img_id][cat_id]:
+                        if pred['score'] >= threshold:
+                            if pred['matched']:
+                                tp += 1
+                            else:
+                                fp += 1
+            
+            precision = tp / (tp + fp) if (tp + fp) > 0 else 0
+            threshold_metrics.append((threshold, precision, tp, fp))
+        
+        # Find threshold with best precision
+        best_threshold = max(threshold_metrics, key=lambda x: x[1])
+        analytics['optimal_confidence_threshold'] = {
+            'threshold': best_threshold[0],
+            'precision': best_threshold[1],
+            'true_positives': best_threshold[2],
+            'false_positives': best_threshold[3]
+        }
+        
+        return analytics
 
     def _run_coco_evaluation(self, coco_gt, coco_results, output_dir=None):
         """
@@ -2358,7 +2832,8 @@ class MultiModels:
                 # Get label
                 if i < len(gt_labels):
                     label_id = int(gt_labels[i])
-                    label_name = self.class_names.get(label_id, f"class_{label_id}")
+                    coco80classcat_id = label_id #inverse_coco_id_mapping[label_id]
+                    label_name = self.class_names.get(coco80classcat_id, f"class_{coco80classcat_id}")
                     
                     # Draw label
                     cv2.putText(img, f"GT: {label_name}", (x1, y1 - 10), 
@@ -2399,7 +2874,8 @@ class MultiModels:
             # Get label and score
             if i < len(labels) and i < len(scores):
                 label_id = int(labels[i])
-                label_name = self.class_names.get(label_id, f"class_{label_id}")
+                coco80classcat_id = label_id #inverse_coco_id_mapping[label_id]
+                label_name = self.class_names.get(coco80classcat_id, f"class_{coco80classcat_id}")
                 score = scores[i]
                 
                 # Draw label with score
@@ -2519,6 +2995,11 @@ class MultiModels:
             cv2.putText(padded_img, f"IoU Threshold: 0.5", (10, y_pos), 
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 1)
 
+        # Save or display the image
+        if output_path:
+            os.makedirs(os.path.dirname(output_path), exist_ok=True)
+            cv2.imwrite(output_path, padded_img)
+
     def _visualize_detections(self, image, detections, ground_truth=None, output_path=None, score_threshold=0.25):
         """
         Visualize detection results on an image.
@@ -2560,8 +3041,9 @@ class MultiModels:
                 # Get label
                 if i < len(gt_labels):
                     label_id = int(gt_labels[i])
-                    label_name = self.class_names.get(label_id, f"class_{label_id}")
-                    
+                    #coco80classcat_id = inverse_coco_id_mapping[label_id]
+                    # Handle case where cat_id is not in the mapping
+                    cat_name = self._get_category_name(cat_id)
                     # Draw label
                     cv2.putText(img, f"GT: {label_name}", (x1, y1 - 10), 
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, gt_color, 2)
@@ -2586,7 +3068,8 @@ class MultiModels:
             # Get label and score
             if i < len(labels) and i < len(scores):
                 label_id = int(labels[i])
-                label_name = self.class_names.get(label_id, f"class_{label_id}")
+                coco80classcat_id = label_id #inverse_coco_id_mapping[label_id]
+                label_name = self.class_names.get(coco80classcat_id, f"class_{coco80classcat_id}")
                 score = scores[i]
                 
                 # Draw label with score
@@ -3206,16 +3689,16 @@ def test_multimodels():
     
     # Parse command line arguments
     parser = argparse.ArgumentParser(description='Test MultiModels object detection')
-    parser.add_argument('--model', type=str, default='yolov8', help='Model type (yolov8, detr, rt-detr, rt-detrv2, vitdet)')
+    parser.add_argument('--model', type=str, default='detr', help='Model type (yolov8, detr, rt-detr, rt-detrv2, vitdet)')
     parser.add_argument('--weights', type=str, default="", help='Path to model weights: ../modelzoo/yolov8s_statedicts.pt')
-    parser.add_argument('--hub_model', type=str, default="lkk688/yolov8x-model", help='HF Hub model name (e.g., "facebook/detr-resnet-50")')
+    parser.add_argument('--hub_model', type=str, default="facebook/detr-resnet-50", help='HF Hub model name (e.g., lkk688/yolov8x-model, "facebook/detr-resnet-50", PekingU/rtdetr_v2_r18vd)')
     parser.add_argument('--image', type=str, default="ModelDev/sampledata/sjsupeople.jpg", help='Path to test image')
     parser.add_argument('--conf', type=float, default=0.25, help='Confidence threshold')
     parser.add_argument('--iou', type=float, default=0.45, help='IoU threshold for NMS')
     parser.add_argument('--output_dir', type=str, default="output", help='Output directory')
     parser.add_argument('--eval_coco', action='store_true', default=True, help='Evaluate on COCO dataset')
     parser.add_argument('--coco_dir', type=str, default="/DATA10T/Datasets/COCOoriginal", help='COCO dataset directory')
-    parser.add_argument('--eval_kitti', action='store_true', default=True, help='Evaluate on KITTI dataset')
+    parser.add_argument('--eval_kitti', action='store_true', default=False, help='Evaluate on KITTI dataset')
     parser.add_argument('--kitti_dir', type=str, default="/DATA10T/Datasets/Kitti/", help='KITTI dataset directory')
     args = parser.parse_args()
     
@@ -3341,4 +3824,5 @@ def test_multimodels():
                 print("  No valid evaluation results returned.")
 
 if __name__ == "__main__":
+    test_rtdetr()
     test_multimodels()

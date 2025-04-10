@@ -130,6 +130,46 @@ kitti_to_coco = {
     'DontCare': 91
 }
 
+def convertpred2kitti(img_id, pred_boxes, pred_labels, pred_scores, threshold=0.5, output_dir="output/kittiformat"):
+    #pred_boxes format is xyxy
+    # Map COCO class ID to KITTI class name
+    id_to_kittiname = {
+        0: 'Pedestrian',  # person
+        1: 'Cyclist',     # bicycle
+        2: 'Car',         # car
+        3: 'Cyclist',     # motorcycle
+        5: 'Car',         # bus
+        7: 'Truck',       # truck
+        9: 'Misc'         # traffic light
+    }
+
+    # Convert each detection to KITTI format
+    image_results = []
+    
+    for box_idx in range(len(pred_boxes)):
+        x1, y1, x2, y2 = pred_boxes[box_idx]
+        # Get category ID and map to KITTI class
+        label = pred_labels[box_idx]
+        category_id = int(label)
+    
+        kitti_class = id_to_kittiname.get(category_id, 'DontCare')
+        
+        # Skip classes that don't map to KITTI
+        if kitti_class == 'DontCare' and pred_scores[box_idx] < threshold:
+            continue
+        
+        # Format: type truncated occluded alpha x1 y1 x2 y2 h w l x y z rotation_y score
+        kitti_line = f"{kitti_class} 0.0 0 0.0 {x1:.2f} {y1:.2f} {x2:.2f} {y2:.2f} 0.0 0.0 0.0 0.0 0.0 0.0 {pred_scores[box_idx]:.6f}"
+        image_results.append(kitti_line)
+    
+    # Save detections to file if output directory is provided
+    if output_dir:
+        # Use original ID for file naming
+        result_file = os.path.join(output_dir, f"{img_id}.txt")
+        with open(result_file, 'w') as f:
+            for line in image_results:
+                f.write(line + '\n')
+
 class DetectionDataset(Dataset):
     """
     Universal detection dataset class that supports COCO, KITTI, and other formats.
@@ -181,6 +221,8 @@ class DetectionDataset(Dataset):
         self._coco = None
         self.image_ids = []
         self.image_paths = []
+        # Store image paths for each image ID
+        self.image_id_to_path = {}
         # Create category ID to COCO class ID mapping
         self.cat_id_to_coco_id = {}
         
@@ -584,7 +626,7 @@ class DetectionDataset(Dataset):
                 # Rotate corners
                 corners = corners.reshape(-1, 2)
                 corners = np.hstack((corners, np.ones((corners.shape[0], 1))))
-                corners = np.dot(corners, M.T).reshape(-1, 4, 2)
+                corners = np.matmul(corners, M.T).reshape(-1, 4, 2)
                 
                 # Get new bounding boxes from rotated corners
                 for i, corner in enumerate(corners):
@@ -760,12 +802,15 @@ class DetectionDataset(Dataset):
                 }
                 return {'img': torch.from_numpy(img.transpose(2, 0, 1)).float() / 255.0, 'target': target, 'image_id': img_id}
             
+            # Store the image path for this image ID
+            self.image_id_to_path[img_id] = img_path
             img = cv2.imread(img_path)
             img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
             
             # Cache image if enabled
             if self.cache_images:
-                self.img_cache[img_id] = img
+                if self.img_cache is not None:
+                    self.img_cache[img_id] = img
         
         # Get annotations
         ann_ids = self._coco.getAnnIds(imgIds=img_id)
@@ -872,10 +917,15 @@ class DetectionDataset(Dataset):
         # Get image path
         img_path = self.image_paths[idx]
         img_id = os.path.basename(img_path).split('.')[0]
+        # Store the image path for this image ID
+        self.image_id_to_path[img_id] = img_path
+        # Also store with numeric ID for compatibility
+        if img_id.isdigit():
+            self.image_id_to_path[int(img_id)] = img_path
         
         # Check if image is cached
-        if self.cache_images and img_id in self.img_cache:
-            img = self.img_cache[img_id]
+        if self.cache_images and self.img_cache is not None and img_id in self.img_cache.keys():
+            img = self.img_cache.get(img_id)
         else:
             # Load image
             img = cv2.imread(img_path)
@@ -883,7 +933,8 @@ class DetectionDataset(Dataset):
             
             # Cache image if enabled
             if self.cache_images:
-                self.img_cache[img_id] = img
+                if self.img_cache is not None:
+                    self.img_cache[img_id] = img
         
         # Get label file path
         label_path = os.path.join(self.label_dir, f"{img_id}.txt")
@@ -987,8 +1038,8 @@ class DetectionDataset(Dataset):
         img_id = self.image_ids[idx]
         
         # Check if image is cached
-        if self.cache_images and img_id in self.img_cache:
-            img = self.img_cache[img_id]
+        if self.cache_images and self.img_cache is not None and img_id in self.img_cache.keys():
+            img = self.img_cache.get(img_id)
         elif self.preprocess:
             # Load image
             img_path = os.path.join(self.image_dir, f"{img_id}.jpg")
@@ -997,7 +1048,8 @@ class DetectionDataset(Dataset):
             
             # Cache image if enabled
             if self.cache_images:
-                self.img_cache[img_id] = img
+                if self.img_cache is not None:
+                    self.img_cache[img_id] = img
         
         # Get annotation file path
         ann_path = os.path.join(self.annotation_dir, f"{img_id}.xml")
