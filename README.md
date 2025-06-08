@@ -10,7 +10,10 @@ cd VisionLangAnnotate
 pip freeze > requirements.txt
 pip install -r requirements.txt
 #Install in Development Mode
-pip install -e .
+#pip install -e .
+pip install flit
+flit install --symlink
+#test import models: >>> import VisionLangAnnotateModels
 ```
 
 Create Conda virtual environment and install cuda

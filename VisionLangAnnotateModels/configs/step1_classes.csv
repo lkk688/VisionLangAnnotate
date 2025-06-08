@@ -1,0 +1,11 @@
+Step 1 Class,Description
+vehicle,"All types of cars, vans, trucks, motorcycles"
+person,"Pedestrians, workers, vendors"
+trash_can,"Residential trash bins, commercial dumpsters"
+road_sign,"Street signs, construction signs"
+traffic_light,All traffic signal lights
+tree,Trees and overhanging branches
+trash,"Dumped trash, debris, yard waste"
+road_surface,"Road areas including potholes, water, striping"
+pole/utility,"Poles, bollards, cables, cones"
+other,"Any object not easily classifiable or rare classes like graffiti, street vendors, or obscure obstructions"

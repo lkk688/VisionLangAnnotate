@@ -1,0 +1,22 @@
+detectors:
+  - name: yolov8
+    model_path: yolov8x.pt
+
+  - name: detr
+    model_name: facebook/detr-resnet-50
+
+  - name: rtdetr
+    model_name: SenseTime/deformable-detr
+
+vlm:
+  model_name: Salesforce/blip2-opt-2.7b
+  device: cuda
+
+ensemble:
+  method: weighted_boxes_fusion
+  iou_threshold: 0.5
+  confidence_threshold: 0.3
+
+image_size: 1024
+output:
+  label_studio_json: label_studio_output.json
