@@ -67,6 +67,12 @@ class BaseMultiModel:
         self._update_model_config_with_class_names()
         self.dataset = None
     
+    def to(self, device):
+        """Move the model to the specified device."""
+        if self.model is not None:
+            self.model = self.model.to(device)
+        return self
+
     def _update_model_config_with_class_names(self):
         """Update the model's configuration with COCO class names if needed."""
         if hasattr(self.model, 'config'):
@@ -314,3 +320,6 @@ class BaseMultiModel:
 if __name__ == "__main__":
     #huggingface-cli login
     base_model = BaseMultiModel(model_type='rt-detr', model_name="PekingU/rtdetr_v2_r18vd", device='cuda')
+    print(base_model.model_type)
+    print(base_model.model)
+    print(base_model.class_names)

@@ -257,11 +257,13 @@ def test_rtdetrv2():
 
 if __name__ == "__main__":
     #huggingface-cli login
-    test_rtdetrv2()
-    base_model = BaseMultiModel(model_type='rt-detr', model_name='rt-detrv2', device='cuda')
-    inference = ModelInference(base_model)
-    inference.predict(
+    #test_rtdetrv2()
+    base_model = ModelInference(model_type='rt-detr', model_name="PekingU/rtdetr_v2_r18vd", device='cuda')
+    # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # base_model.model = base_model.model.to(device)  # Move the underlying model to device
+    # inference = ModelInference(base_model)
+    results = base_model.predict(
             image_path="VisionLangAnnotateModels/sampledata/sjsupeople.jpg",
             visualize=True,
-            save_path="./output"
+            save_path="./output/testsjsudetection.jpg"
         )

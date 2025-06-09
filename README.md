@@ -73,6 +73,19 @@ Dockerize: backend/Dockerfile
 Backend: Deploy FastAPI (Render, Railway).
 Frontend: Deploy React (Vercel, Netlify).
 
+## GCP Setup
+Install gcloud cli from https://cloud.google.com/sdk/docs/install-sdk#deb
+```bash
+gcloud init
+gcloud auth login
+gcloud config set project <project_id>
+gcloud config set compute/zone <zone>
+$ gcloud projects list
+gsutil ls gs://roadsafetytarget/
+gsutil ls "gs://roadsafetysource/Sweeper 19303/"
+gcloud auth application-default login
+```
+
 ## File Structure
 
 annotation-tool/
