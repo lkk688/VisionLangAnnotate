@@ -1,7 +1,9 @@
 import torch
 import argparse
 import os
-from typing import Dict, Any, List, Optional
+import numpy as np
+from PIL import Image
+from typing import Dict, Any, List, Optional, Union
 import logging
 from torch.utils.data import DataLoader
 
@@ -25,15 +27,32 @@ class TestPipeline:
         self.evaluator = ModelEvaluator(self.base_model)
         self.trainer = ModelTrainer(self.base_model, self.evaluator)
     
-    def test_inference(self, image_path: str, confidence_threshold: float = 0.5,
+    def test_inference(self, image_input: Union[str, np.ndarray, Image.Image, torch.Tensor], confidence_threshold: float = 0.5,
                       visualize: bool = True, save_path: str = None) -> Dict[str, Any]:
-        """Test inference on a single image."""
+        """Test inference on a single image.
         
-        self.logger.info(f"Testing inference on: {image_path}")
+        Args:
+            image_input: Input image in one of the following formats:
+                - Path to image file (str)
+                - PIL Image object
+                - NumPy array (BGR or RGB format)
+                - PyTorch tensor (C,H,W format)
+            confidence_threshold: Confidence threshold for detections
+            visualize: Whether to show visualization
+            save_path: Path to save visualization
+            
+        Returns:
+            Dictionary with detection results
+        """
+        
+        if isinstance(image_input, str):
+            self.logger.info(f"Testing inference on: {image_input}")
+        else:
+            self.logger.info(f"Testing inference on image of type: {type(image_input)}")
         
         results = self.inference.predict(
-            image_path=image_path,
-            confidence_threshold=confidence_threshold,
+            image_input=image_input,
+            conf_thres=confidence_threshold,
             visualize=visualize,
             save_path=save_path
         )

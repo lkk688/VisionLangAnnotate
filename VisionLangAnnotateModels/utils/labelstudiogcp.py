@@ -2,6 +2,8 @@ import os
 import json
 import matplotlib.pyplot as plt
 import numpy as np
+import cv2
+import torch
 #pip install --upgrade google-cloud-storage
 from google.cloud import storage
 from PIL import Image
@@ -58,8 +60,33 @@ def download_image_from_gcs(gcs_path):
 
 
 # ---------------- VISUALIZATION ----------------
-def visualize(image_path, annotation_data):
-    image = np.array(Image.open(image_path).convert("RGB"))
+def visualize(image_input, annotation_data):
+    # Handle different image input types
+    if isinstance(image_input, str):
+        # Load from file path
+        image = np.array(Image.open(image_input).convert("RGB"))
+    elif isinstance(image_input, np.ndarray):
+        # Already a numpy array
+        image = image_input
+        # Convert BGR to RGB if needed (OpenCV uses BGR)
+        if len(image.shape) == 3 and image.shape[2] == 3:
+            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    elif isinstance(image_input, Image.Image):
+        # PIL Image
+        image = np.array(image_input.convert("RGB"))
+    elif isinstance(image_input, torch.Tensor):
+        # PyTorch tensor
+        img = image_input.detach().cpu().numpy()
+        # If tensor is in [C, H, W] format, convert to [H, W, C]
+        if len(img.shape) == 3 and img.shape[0] == 3:
+            img = np.transpose(img, (1, 2, 0))
+        # Convert to uint8 if needed
+        if img.dtype != np.uint8:
+            img = (img * 255).astype(np.uint8)
+        image = img
+    else:
+        raise ValueError(f"Unsupported image input type: {type(image_input)}")
+    
     fig, ax = plt.subplots(1, figsize=(12, 8))
     ax.imshow(image)
 
@@ -84,8 +111,33 @@ def visualize(image_path, annotation_data):
     plt.axis('off')
     plt.show()
 
-def visualize_and_save(image_path, annotation_data, relative_path):
-    image = np.array(Image.open(image_path).convert("RGB"))
+def visualize_and_save(image_input, annotation_data, relative_path):
+    # Handle different image input types
+    if isinstance(image_input, str):
+        # Load from file path
+        image = np.array(Image.open(image_input).convert("RGB"))
+    elif isinstance(image_input, np.ndarray):
+        # Already a numpy array
+        image = image_input
+        # Convert BGR to RGB if needed (OpenCV uses BGR)
+        if len(image.shape) == 3 and image.shape[2] == 3:
+            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    elif isinstance(image_input, Image.Image):
+        # PIL Image
+        image = np.array(image_input.convert("RGB"))
+    elif isinstance(image_input, torch.Tensor):
+        # PyTorch tensor
+        img = image_input.detach().cpu().numpy()
+        # If tensor is in [C, H, W] format, convert to [H, W, C]
+        if len(img.shape) == 3 and img.shape[0] == 3:
+            img = np.transpose(img, (1, 2, 0))
+        # Convert to uint8 if needed
+        if img.dtype != np.uint8:
+            img = (img * 255).astype(np.uint8)
+        image = img
+    else:
+        raise ValueError(f"Unsupported image input type: {type(image_input)}")
+    
     fig, ax = plt.subplots(1, figsize=(12, 8))
     ax.imshow(image)
 
@@ -174,8 +226,14 @@ def main(SNAPSHOT_JSON_PATH):
 if __name__ == "__main__":
     #annotations = download_annotation_files() #1664
     # Download all images from gs://roadsafetysource/Sweeper 19303/
+    # downloaded = download_all_images_from_gcs(
+    #     bucket_name="roadsafetysource",
+    #     gcs_prefix="",
+    #     local_download_dir="./output/gcs_sources"
+    # )
+    #roadsafetyparkingcompliance
     downloaded = download_all_images_from_gcs(
-        bucket_name="roadsafetysource",
+        bucket_name="roadsafetyparkingcompliance",
         gcs_prefix="",
         local_download_dir="./output/gcs_sources"
     )

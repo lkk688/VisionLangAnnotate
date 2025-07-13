@@ -127,7 +127,8 @@ class MultiModels:
                     ch=3,
                     min_size=640,
                     max_size=640,
-                    use_fp16=True if self.device.type == 'cuda' else False
+                    use_fp16=True if (isinstance(self.device, str) and 'cuda' in self.device) or \
+                              (hasattr(self.device, 'type') and self.device.type == 'cuda') else False
                 )
                 
             # Check if a specific model name is provided to load from HF Hub
@@ -261,7 +262,8 @@ class MultiModels:
                 ch=3,
                 min_size=640,
                 max_size=640,
-                use_fp16=True if self.device.type == 'cuda' else False
+                use_fp16=True if (isinstance(self.device, str) and 'cuda' in self.device) or \
+                          (hasattr(self.device, 'type') and self.device.type == 'cuda') else False
             )
         elif model_type in ['detr', 'rt-detr', 'rt-detrv2']:
             from transformers import DetrConfig
@@ -281,7 +283,8 @@ class MultiModels:
                 ch=3,
                 min_size=640,
                 max_size=640,
-                use_fp16=True if self.device.type == 'cuda' else False
+                use_fp16=True if (isinstance(self.device, str) and 'cuda' in self.device) or \
+                          (hasattr(self.device, 'type') and self.device.type == 'cuda') else False
             )
     
     def _create_processor(self):

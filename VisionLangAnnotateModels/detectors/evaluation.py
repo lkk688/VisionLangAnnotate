@@ -107,7 +107,17 @@ class ModelEvaluator(BaseMultiModel):
     def _run_inference_on_dataset(self, dataset, batch_size=16, conf_thres=0.25, 
                                   iou_thres=0.45, max_det=300, output_dir=None):
         """Run inference on entire dataset and return COCO-format results."""
-        self.model.eval()
+        # For YOLO models, use self.yolo_model instead of self.model
+        if self.model_type == 'yolo':
+            if self.yolo_model is None:
+                raise ValueError("YOLO model not loaded. Please call load_yolo_model() first.")
+            # YOLO models from ultralytics don't need explicit eval() call
+            # They handle it internally during inference
+        else:
+            # For other model types, use the standard self.model
+            if self.model is None:
+                raise ValueError("Model not initialized")
+            self.model.eval()
         
         # Create data loader
         dataloader = DataLoader(
@@ -132,8 +142,20 @@ class ModelEvaluator(BaseMultiModel):
                 image_ids = batch['image_id']
                 original_sizes = batch.get('original_size', None)
                 
-                # Run inference
-                outputs = self.model(pixel_values=images)
+                # Run inference based on model type
+                if self.model_type == 'yolo':
+                    # For YOLO models, we need to convert the batch tensor to a list of images
+                    # and run inference on each image
+                    outputs = []
+                    for i in range(len(images)):
+                        # Convert tensor to PIL Image for YOLO
+                        img = self._tensor_to_pil(images[i])
+                        # Run YOLO inference
+                        result = self.yolo_model(img, conf=conf_thres, iou=iou_thres, max_det=max_det)
+                        outputs.append(result)
+                else:
+                    # Standard inference for other model types
+                    outputs = self.model(pixel_values=images)
                 
                 # Process each image in the batch
                 for i in range(len(images)):
@@ -517,8 +539,37 @@ class ModelEvaluator(BaseMultiModel):
                 'boxes': boxes_list
             }
     
+    def _tensor_to_pil(self, tensor):
+        """Convert a PyTorch tensor to a PIL Image for YOLO inference.
+        
+        Args:
+            tensor: PyTorch tensor in (C, H, W) format
+            
+        Returns:
+            PIL Image
+        """
+        # Convert tensor to numpy array
+        if tensor.dim() == 4:  # (B, C, H, W)
+            tensor = tensor[0]  # Take the first image in the batch
+            
+        # Convert to numpy and transpose from (C, H, W) to (H, W, C)
+        img_np = tensor.cpu().numpy().transpose(1, 2, 0)
+        
+        # Denormalize if needed (assuming values are in [0, 1])
+        if img_np.max() <= 1.0:
+            img_np = (img_np * 255).astype(np.uint8)
+        
+        # Convert to PIL Image
+        from PIL import Image
+        return Image.fromarray(img_np)
+    
     def _extract_single_output(self, outputs, index):
         """Extract outputs for a single image from batch outputs."""
+        # For YOLO models, outputs is a list of Results objects
+        if self.model_type == 'yolo':
+            return outputs[index]
+        
+        # For other models, extract the tensors for the specific index
         single_output = {}
         
         for key, value in outputs.items():
@@ -531,8 +582,30 @@ class ModelEvaluator(BaseMultiModel):
     
     def _post_process_single_output(self, outputs, original_size, conf_thres, iou_thres, max_det):
         """Post-process outputs for a single image."""
+        # For YOLO models, outputs is a Results object from ultralytics
+        if self.model_type == 'yolo':
+            detections = []
+            # Check if there are any detections
+            if len(outputs.boxes) > 0:
+                boxes = outputs.boxes.xyxy.cpu().numpy()
+                scores = outputs.boxes.conf.cpu().numpy()
+                class_ids = outputs.boxes.cls.cpu().numpy().astype(int)
+                
+                for i in range(len(boxes)):
+                    class_id = int(class_ids[i])
+                    class_name = outputs.names[class_id] if class_id in outputs.names else f"class_{class_id}"
+                    
+                    detections.append({
+                        'bbox': boxes[i].tolist(),
+                        'score': float(scores[i]),
+                        'class_id': class_id,
+                        'class_name': class_name
+                    })
+            return detections
+        
+        # For other models, use the standard post-processing
         # This would use the same logic as in the inference module
-        # For now, return empty list as placeholder
+        # For now, return empty list as placeholder for non-YOLO models
         return []
     
     def _create_coco_gt_from_dataset(self, dataset, output_dir=None):
