@@ -349,9 +349,9 @@ def testBlip2_module():
     def generate_response(image, prompt, max_new_tokens=80):
         inputs = processor(images=image, text=prompt, return_tensors="pt")
         for k, v in inputs.items():
-            if v.dtype == torch.float:
+            if v.dtype == torch.float: #'pixel_values'
                 inputs[k] = v.to(model.device, dtype=torch.float16)
-            else:
+            else:#torch.int64
                 inputs[k] = v.to(model.device)
 
         with torch.no_grad():

@@ -1,0 +1,1022 @@
+from abc import ABC, abstractmethod
+import torch
+from PIL import Image, ImageDraw
+import time
+import json
+import os
+import io
+import re
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.patches as patches
+from matplotlib.figure import Figure
+from matplotlib.backends.backend_agg import FigureCanvasAgg as FigureCanvas
+from typing import List, Tuple, Dict, Any, Optional, Union, Callable
+
+#install Flash attention: https://huggingface.co/docs/transformers/perf_infer_gpu_one#flashattention-2
+#pip install flash-attn --no-build-isolation
+
+#Qwen utilities for better handling of visual inputs:
+#pip install qwen-vl-utils[decord]==0.0.8
+
+# Try to import openai, but don't fail if it's not available
+try:
+    import openai
+    OPENAI_AVAILABLE = True
+except ImportError:
+    OPENAI_AVAILABLE = False
+    print("Warning: OpenAI package not available. OpenAIVLM backend will not work.")
+
+# Base imports for transformers
+from transformers import Blip2Processor, Blip2ForConditionalGeneration
+# Additional imports will be loaded dynamically based on model type
+
+class VLMBackend(ABC):
+    """Abstract base class for VLM backends."""
+    
+    @abstractmethod
+    def generate(self, images: List[Image.Image], prompts: List[str]) -> List[str]:
+        """Generate descriptions for images with given prompts."""
+        pass
+    
+    @abstractmethod
+    def get_name(self) -> str:
+        """Get the name of the backend model."""
+        pass
+
+class HuggingFaceVLM(VLMBackend):
+    """Hugging Face-based VLM backend with support for multiple model types.
+    
+    Supported model types:
+    - BLIP2: Salesforce/blip2-opt-2.7b, Salesforce/blip2-flan-t5-xxl, etc.
+    - LLaVA: llava-hf/llava-1.5-7b-hf, llava-hf/llava-v1.6-mistral-7b-hf, etc.
+    - SmolVLM: HuggingFaceTB/SmolVLM-Instruct, HuggingFaceTB/SmolVLM-Base, etc.
+    - MiniGPT-4: Vision-CAIR/MiniGPT-4 (requires special handling)
+    - GLIP: GLIPModel/GLIP (for object detection and grounding)
+    """
+    
+    def __init__(self, model_name: str = "Salesforce/blip2-opt-2.7b", device: str = "cuda"):
+        self.model_name = model_name
+        self.device = device
+        self.dtype = torch.float16 if device == "cuda" else torch.float32
+        
+        # Determine model type based on model_name
+        if "blip2" in model_name.lower():
+            self.model_type = "blip2"
+            self.processor = Blip2Processor.from_pretrained(model_name)
+            self.model = Blip2ForConditionalGeneration.from_pretrained(
+                model_name,
+                torch_dtype=self.dtype
+            ).to(device)
+        elif "llava" in model_name.lower():
+            self.model_type = "llava"
+            from transformers import AutoProcessor, LlavaForConditionalGeneration
+            from transformers import LlavaNextProcessor, LlavaNextForConditionalGeneration
+            
+            # Special handling for LLaVA 1.6 Mistral to avoid Flash Attention 2.0 initialization issue
+            if "llava-v1.6-mistral" in model_name.lower():
+                self.processor = LlavaNextProcessor.from_pretrained(model_name)
+                # First initialize on CPU, then move to GPU to avoid Flash Attention 2.0 issues
+                self.model = LlavaNextForConditionalGeneration.from_pretrained(
+                    model_name,
+                    torch_dtype=self.dtype,
+                    low_cpu_mem_usage=True,
+                    use_flash_attention_2=True, #if device == "cuda"
+                    device_map=None  # Initialize on CPU first
+                )
+                self.model = self.model.to(device)  # Then move to GPU
+            else:
+                self.processor = AutoProcessor.from_pretrained(model_name)
+                # For other LLaVA models, use standard initialization
+                self.model = LlavaForConditionalGeneration.from_pretrained(
+                    model_name,
+                    torch_dtype=self.dtype
+                ).to(device)
+        elif "qwen" in model_name.lower():
+            self.model_type = "qwen"
+            # Import Qwen-specific modules
+            try:
+                from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor
+                self.processor = AutoProcessor.from_pretrained(model_name)
+                
+                # Initialize Qwen model with flash attention if available
+                self.model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+                    model_name,
+                    torch_dtype=self.dtype,
+                    attn_implementation="flash_attention_2" if device == "cuda" else "eager"
+                ).to(device)
+            except ImportError:
+                raise ImportError("Please install the latest transformers version for Qwen2.5-VL support: "
+                                 "pip install git+https://github.com/huggingface/transformers accelerate")
+            except Exception as e:
+                raise Exception(f"Error loading Qwen model: {str(e)}. Make sure you have the latest transformers version.")
+        elif "smolvlm" in model_name.lower():
+            self.model_type = "smolvlm"
+            from transformers import AutoProcessor, AutoModelForVision2Seq
+            self.processor = AutoProcessor.from_pretrained(model_name)
+            self.model = AutoModelForVision2Seq.from_pretrained(
+                model_name,
+                torch_dtype=self.dtype,
+                _attn_implementation="flash_attention_2" if device == "cuda" else "eager"
+            ).to(device)
+        elif "minigpt-4" in model_name.lower():
+            self.model_type = "minigpt4"
+            # MiniGPT-4 uses BLIP-2's visual encoder with Vicuna LLM
+            # This is a simplified implementation - full implementation would require the MiniGPT-4 repo
+            from transformers import AutoProcessor, AutoModelForVision2Seq
+            self.processor = AutoProcessor.from_pretrained(model_name)
+            self.model = AutoModelForVision2Seq.from_pretrained(
+                model_name,
+                torch_dtype=self.dtype
+            ).to(device)
+        elif "glip" in model_name.lower():
+            self.model_type = "glip"
+            # GLIP is primarily for object detection and grounding
+            # This is a simplified implementation - full implementation would require additional code
+            from transformers import AutoProcessor, AutoModelForObjectDetection
+            self.processor = AutoProcessor.from_pretrained(model_name)
+            self.model = AutoModelForObjectDetection.from_pretrained(
+                model_name,
+                torch_dtype=self.dtype
+            ).to(device)
+        else:
+            # Default to BLIP2 for unknown models
+            self.model_type = "blip2"
+            self.processor = Blip2Processor.from_pretrained(model_name)
+            self.model = Blip2ForConditionalGeneration.from_pretrained(
+                model_name,
+                torch_dtype=self.dtype
+            ).to(device)
+    
+    def generate(self, images: List[Image.Image], prompts: List[str]) -> List[str]:
+        if self.model_type == "blip2":
+            return self._generate_blip2(images, prompts)
+        elif self.model_type == "llava":
+            return self._generate_llava(images, prompts)
+        elif self.model_type == "qwen":
+            return self._generate_qwen(images, prompts)
+        elif self.model_type == "smolvlm":
+            return self._generate_smolvlm(images, prompts)
+        elif self.model_type == "minigpt4":
+            return self._generate_minigpt4(images, prompts)
+        elif self.model_type == "glip":
+            return self._generate_glip(images, prompts)
+        else:
+            # Default to BLIP2 generation
+            return self._generate_blip2(images, prompts)
+    
+    def _generate_blip2(self, images: List[Image.Image], prompts: List[str]) -> List[str]:
+        """Generate text using BLIP2 model."""
+        results = []
+        
+        # Process each image-prompt pair individually
+        for image, prompt in zip(images, prompts):
+            # Prepare inputs using the processor
+            inputs = self.processor(images=image, text=prompt, return_tensors="pt")
+            
+            # Convert input tensors to the same dtype as the model
+            for k, v in inputs.items():
+                if torch.is_floating_point(v):
+                    inputs[k] = v.to(device=self.device, dtype=self.dtype)
+                else:
+                    inputs[k] = v.to(self.device)
+            
+            # Generate output with more generation parameters
+            with torch.no_grad():
+                generated_ids = self.model.generate(
+                    **inputs,
+                    max_new_tokens=100,  # Increased from 50
+                    min_length=5,
+                    do_sample=True,
+                    temperature=0.7,
+                    top_k=50,
+                    top_p=0.95,
+                    no_repeat_ngram_size=2,
+                    pad_token_id=self.processor.tokenizer.pad_token_id,
+                    eos_token_id=self.processor.tokenizer.eos_token_id
+                )
+            
+            # Decode result
+            result = self.processor.decode(generated_ids[0], skip_special_tokens=True)
+            # Extract only the assistant's response
+            if "\n" in result:
+                # Remove the first line and any newlines in the response
+                result = result.split("\n", 1)[-1].strip()
+                # Remove any remaining newlines
+                result = result.replace("\n", " ")
+            results.append(result)
+        
+        return results
+    
+    def _generate_llava(self, images: List[Image.Image], prompts: List[str]) -> List[str]:
+        """Generate text using LLaVA model."""
+        results = []
+        
+        for i, (image, prompt) in enumerate(zip(images, prompts)):
+            # Create conversation format for LLaVA
+            conversation = [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image"},
+                        {"type": "text", "text": prompt}
+                    ]
+                }
+            ]
+            
+            # Apply chat template and prepare inputs
+            text_prompt = self.processor.apply_chat_template(conversation, add_generation_prompt=True)
+            
+            inputs = self.processor(
+                text=text_prompt,
+                images=image,
+                return_tensors="pt"
+            ).to(self.device)
+            
+            # Generate response
+            with torch.no_grad():
+                output = self.model.generate(**inputs, max_new_tokens=50, pad_token_id=self.processor.tokenizer.eos_token_id)
+            
+            # Decode and append result
+            try:
+                # Try the standard approach first
+                result = self.processor.batch_decode(output, skip_special_tokens=True)[0]
+                #print(processor.decode(output[0], skip_special_tokens=True))
+            except (ValueError, IndexError):
+                # Handle the case where batch_decode returns a tuple with more than expected values
+                # This is likely happening with LLaVA 1.6 Mistral
+                if isinstance(output, torch.Tensor):
+                    result = self.processor.tokenizer.decode(output[0], skip_special_tokens=True)
+                else:
+                    # If output is not a tensor, try to decode it directly
+                    result = str(output)
+            
+            # Extract only the assistant's response
+            if "ASSISTANT:" in result:
+                result = result.split("ASSISTANT:")[-1].strip()
+            # Handle Qwen [INST] format
+            elif "[/INST]" in result: #used this
+                result = result.split("[/INST]")[-1].strip()
+            results.append(result)
+        
+        return results
+    
+    def _generate_smolvlm(self, images: List[Image.Image], prompts: List[str]) -> List[str]:
+        """Generate text using SmolVLM model."""
+        results = []
+        
+        for i, (image, prompt) in enumerate(zip(images, prompts)):
+            # Create conversation format for SmolVLM
+            conversation = [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image"},
+                        {"type": "text", "text": prompt}
+                    ]
+                }
+            ]
+            
+            # Apply chat template and prepare inputs
+            text_prompt = self.processor.apply_chat_template(conversation, add_generation_prompt=True)
+            inputs = self.processor(
+                text=text_prompt,
+                images=image,
+                return_tensors="pt"
+            ).to(self.device)
+            
+            # Generate response
+            with torch.no_grad():
+                output = self.model.generate(**inputs, max_new_tokens=50)
+            
+            # Decode and append result
+            try:
+                # Try the standard approach first
+                result = self.processor.batch_decode(output, skip_special_tokens=True)[0]
+            except (ValueError, IndexError):
+                # Handle the case where batch_decode returns a tuple with more than expected values
+                if isinstance(output, torch.Tensor):
+                    result = self.processor.tokenizer.decode(output[0], skip_special_tokens=True)
+                else:
+                    # If output is not a tensor, try to decode it directly
+                    result = str(output)
+            
+            # Extract only the assistant's response
+            if "Assistant:" in result:
+                result = result.split("Assistant:")[-1].strip()
+            results.append(result)
+        
+        return results
+    
+    def _generate_minigpt4(self, images: List[Image.Image], prompts: List[str]) -> List[str]:
+        """Generate text using MiniGPT-4 model."""
+        # MiniGPT-4 implementation is similar to SmolVLM
+        results = []
+        
+        for i, (image, prompt) in enumerate(zip(images, prompts)):
+            # Create conversation format for MiniGPT-4
+            conversation = [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image"},
+                        {"type": "text", "text": prompt}
+                    ]
+                }
+            ]
+            
+            # Apply chat template and prepare inputs
+            text_prompt = self.processor.apply_chat_template(conversation, add_generation_prompt=True)
+            inputs = self.processor(
+                text=text_prompt,
+                images=image,
+                return_tensors="pt"
+            ).to(self.device)
+            
+            # Generate response
+            with torch.no_grad():
+                output = self.model.generate(**inputs, max_new_tokens=50)
+            
+            # Decode and append result
+            try:
+                # Try the standard approach first
+                result = self.processor.batch_decode(output, skip_special_tokens=True)[0]
+            except (ValueError, IndexError):
+                # Handle the case where batch_decode returns a tuple with more than expected values
+                if isinstance(output, torch.Tensor):
+                    result = self.processor.tokenizer.decode(output[0], skip_special_tokens=True)
+                else:
+                    # If output is not a tensor, try to decode it directly
+                    result = str(output)
+            
+            # Extract only the assistant's response
+            if "ASSISTANT:" in result:
+                result = result.split("ASSISTANT:")[-1].strip()
+            results.append(result)
+        
+        return results
+    
+    def _generate_qwen(self, images: List[Image.Image], prompts: List[str]) -> List[str]:
+        """Generate text using Qwen2.5-VL model.
+        
+        Optimized to process multiple images in a single batch when they are from the same source image.
+        This optimization is particularly useful when processing multiple cropped regions from a single
+        image, as it allows the model to see all regions at once and generate responses more efficiently.
+        
+        The method automatically detects when batch processing is appropriate and falls back to
+        individual processing when necessary. For best results, ensure that:
+        1. All images in the batch are from the same source image (e.g., cropped regions)
+        2. The number of images matches the number of prompts
+        3. Each prompt is specific to its corresponding image region
+        
+        The optimization can significantly reduce processing time when handling multiple regions
+        from the same image, as it requires only one model inference instead of multiple separate calls.
+        """
+        # Check if we're processing multiple regions from the same image
+        if len(images) <= 1 or len(images) != len(prompts):
+            # Fall back to original implementation for single image or mismatched lists
+            return self._generate_qwen_single(images, prompts)
+        
+        # Process multiple images in a single batch
+        try:
+            # Create conversation format for Qwen with multiple images
+            conversation = [
+                {
+                    "role": "user",
+                    "content": []
+                }
+            ]
+            
+            # Add all images to the content, resizing small images if needed
+            resized_images = []
+            for image in images:
+                # Check if image dimensions are smaller than the required factor of 28
+                width, height = image.size
+                if width < 28 or height < 28:
+                    print(f"Resizing small image in _generate_qwen batch processing: {width}x{height} -> minimum factor of 28")
+                    # Calculate new dimensions that are multiples of 28
+                    new_width = max(28, ((width + 27) // 28) * 28)
+                    new_height = max(28, ((height + 27) // 28) * 28)
+                    print(f"New dimensions: {new_width}x{new_height}")
+                    # Resize the image using a high-quality resampling method
+                    try:
+                        # For newer PIL versions
+                        resized_image = image.resize((new_width, new_height), Image.Resampling.LANCZOS)
+                    except AttributeError:
+                        # For older PIL versions
+                        resized_image = image.resize((new_width, new_height), Image.LANCZOS)
+                    resized_images.append(resized_image)
+                    conversation[0]["content"].append({"type": "image"})
+                else:
+                    resized_images.append(image)
+                    conversation[0]["content"].append({"type": "image"})
+            
+            # Add the text prompt (using the first prompt as the main question)
+            # We'll include all individual prompts in the text to maintain context
+            combined_prompt = "For each region in the provided images, answer the following:\n"
+            for i, prompt in enumerate(prompts):
+                combined_prompt += f"Region {i+1}: {prompt}\n"
+            
+            conversation[0]["content"].append({"type": "text", "text": combined_prompt})
+            
+            # Apply chat template
+            text_prompt = self.processor.tokenizer.apply_chat_template(
+                conversation,
+                tokenize=False,
+                add_generation_prompt=True
+            )
+            
+            # Process inputs with multiple images (using resized images)
+            inputs = self.processor(
+                text=[text_prompt],
+                images=resized_images,  # Pass resized images as a list
+                padding=True,
+                return_tensors="pt"
+            ).to(self.device)
+            
+            # Generate response
+            with torch.no_grad():
+                generated_ids = self.model.generate(**inputs, max_new_tokens=256)  # Increased token limit for multiple responses
+            
+            # Decode the output
+            try:
+                # Try to get just the new tokens (excluding input tokens)
+                generated_ids_trimmed = [
+                    out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
+                ]
+                result = self.processor.batch_decode(
+                    generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
+                )[0]
+            except (ValueError, IndexError, AttributeError):
+                # Fall back to standard decoding if trimming fails
+                result = self.processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
+            
+            # Extract only the assistant's response
+            if "assistant:" in result.lower():
+                result = re.split(r'assistant:', result, flags=re.IGNORECASE)[-1].strip()
+            # Handle Qwen [INST] format
+            elif "[/INST]" in result:
+                result = result.split("[/INST]")[-1].strip()
+            
+            # Parse the result to extract individual responses for each region
+            # This assumes the model follows our format of "Region X: [response]"
+            results = []
+            region_pattern = r'Region \d+:?\s*(.*?)(?=Region \d+:|$)'
+            region_matches = re.finditer(region_pattern, result, re.DOTALL)
+            
+            for match in region_matches:
+                results.append(match.group(1).strip())
+            
+            # If we couldn't parse individual responses, split the result evenly
+            if not results:
+                # Fall back to individual processing
+                return self._generate_qwen_single(images, prompts)
+            
+            # Ensure we have a result for each prompt
+            while len(results) < len(prompts):
+                results.append("No response generated for this region.")
+            
+            # Trim to match the number of prompts
+            results = results[:len(prompts)]
+            
+            return results
+        
+        except Exception as e:
+            print(f"Error in batch Qwen processing: {str(e)}. Falling back to individual processing.")
+            # Fall back to individual processing if batch processing fails
+            return self._generate_qwen_single(images, prompts)
+    
+    def _generate_qwen_single(self, images: List[Image.Image], prompts: List[str]) -> List[str]:
+        """Process images individually with Qwen model (original implementation)."""
+        results = []
+        
+        for i, (image, prompt) in enumerate(zip(images, prompts)):
+            # Create conversation format for Qwen
+            conversation = [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image"},
+                        {"type": "text", "text": prompt}
+                    ]
+                }
+            ]
+            
+            # Apply chat template and prepare inputs
+            text_prompt = self.processor.tokenizer.apply_chat_template(
+                conversation, 
+                tokenize=False,
+                add_generation_prompt=True
+            )
+            
+            # Check if image dimensions are smaller than the required factor of 28
+            width, height = image.size
+            if width < 28 or height < 28:
+                print(f"Resizing small image in _generate_qwen_single: {width}x{height} -> minimum factor of 28")
+                # Calculate new dimensions that are multiples of 28
+                new_width = max(28, ((width + 27) // 28) * 28)
+                new_height = max(28, ((height + 27) // 28) * 28)
+                print(f"New dimensions: {new_width}x{new_height}")
+                # Resize the image using a high-quality resampling method
+                try:
+                    # For newer PIL versions
+                    image = image.resize((new_width, new_height), Image.Resampling.LANCZOS)
+                except AttributeError:
+                    # For older PIL versions
+                    image = image.resize((new_width, new_height), Image.LANCZOS)
+            
+            # Process inputs
+            inputs = self.processor(
+                text=text_prompt,
+                images=image,
+                return_tensors="pt"
+            ).to(self.device)
+            
+            # Generate response
+            with torch.no_grad():
+                output = self.model.generate(**inputs, max_new_tokens=50)
+            
+            # Decode and append result
+            try:
+                # Try the standard approach first
+                result = self.processor.batch_decode(output, skip_special_tokens=True)[0]
+            except (ValueError, IndexError):
+                # Handle the case where batch_decode returns a tuple with more than expected values
+                if isinstance(output, torch.Tensor):
+                    result = self.processor.tokenizer.decode(output[0], skip_special_tokens=True)
+                else:
+                    # If output is not a tensor, try to decode it directly
+                    result = str(output)
+            
+            # Extract only the assistant's response
+            if "assistant\n" in result.lower():
+                result = re.split(r'assistant\n', result, flags=re.IGNORECASE)[-1].strip()
+            results.append(result)
+        
+        return results
+    
+    def _generate_glip(self, images: List[Image.Image], prompts: List[str]) -> List[str]:
+        """Generate text using GLIP model for object detection and grounding."""
+        results = []
+        
+        for i, (image, prompt) in enumerate(zip(images, prompts)):
+            # GLIP is primarily for object detection and grounding
+            # Here we're using it to detect objects mentioned in the prompt
+            inputs = self.processor(images=image, text=prompt, return_tensors="pt").to(self.device)
+            
+            with torch.no_grad():
+                outputs = self.model(**inputs)
+            
+            # Process detection results
+            target_sizes = torch.tensor([image.size[::-1]]).to(self.device)
+            results_processed = self.processor.post_process_object_detection(
+                outputs, 
+                threshold=0.5, 
+                target_sizes=target_sizes
+            )[0]
+            
+            # Format results as text
+            detections = []
+            for score, label, box in zip(results_processed["scores"], results_processed["labels"], results_processed["boxes"]):
+                detections.append(f"{self.processor.tokenizer.decode(label)}: {score:.2f} at {box.tolist()}")
+            
+            results.append("\n".join(detections) if detections else "No objects detected.")
+        
+        return results
+    
+    def get_name(self) -> str:
+        return f"HuggingFace-{self.model_type}-{self.model_name.split('/')[-1]}"
+
+class OpenAIVLM(VLMBackend):
+    """OpenAI-based VLM backend (GPT-4V)."""
+    
+    def __init__(self, api_key: str):
+        if not OPENAI_AVAILABLE:
+            raise ImportError("OpenAI package is not available. Please install it with 'pip install openai'.")
+        
+        # Import is done at the module level with try/except
+        self.client = openai.OpenAI(api_key=api_key)
+    
+    def generate(self, images: List[Image.Image], prompts: List[str]) -> List[str]:
+        if not OPENAI_AVAILABLE:
+            return ["Error: OpenAI package not available"] * len(images)
+        
+        results = []
+        for image, prompt in zip(images, prompts):
+            # Convert PIL Image to bytes
+            img_byte_arr = io.BytesIO()
+            image.save(img_byte_arr, format='PNG')
+            img_byte_arr = img_byte_arr.getvalue()
+            
+            try:
+                response = self.client.chat.completions.create(
+                    model="gpt-4-vision-preview",
+                    messages=[
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": prompt},
+                                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{img_byte_arr}"}}
+                            ]
+                        }
+                    ],
+                    max_tokens=50
+                )
+                results.append(response.choices[0].message.content)
+            except Exception as e:
+                results.append(f"Error: {str(e)}")
+        
+        return results
+    
+    def get_name(self) -> str:
+        return "OpenAI-GPT4V"
+
+class VLMClassifier:
+    """Enhanced VLM Classifier with multiple backends and evaluation capabilities."""
+    
+    def __init__(self, backend: VLMBackend):
+        self.backend = backend
+    
+    def embed_box_on_image(self, image: Image.Image, bbox: Tuple[int, int, int, int], 
+                          color: str = "red", width: int = 4) -> Image.Image:
+        """Draw bounding box on image for visual context."""
+        img = image.copy()
+        draw = ImageDraw.Draw(img)
+        draw.rectangle(bbox, outline=color, width=width)
+        return img
+    
+    def two_view_image(self, crop: Image.Image, full_context: Image.Image) -> Image.Image:
+        """Create a two-view image combining crop and context."""
+        context_resized = full_context.resize(crop.size)
+        combined = Image.new("RGB", (crop.width * 2, crop.height))
+        combined.paste(crop, (0, 0))
+        combined.paste(context_resized, (crop.width, 0))
+        return combined
+    
+    def classify(self, image_crops_with_prompts: List[Tuple[Image.Image, str]]) -> List[str]:
+        """Basic classification of image crops."""
+        images, prompts = zip(*image_crops_with_prompts)
+        return self.backend.generate(list(images), list(prompts))
+    
+    def classify_relativepos(self, object_crops: List[Image.Image], 
+                           full_context_images: List[Image.Image], 
+                           prompts: List[str]) -> List[str]:
+        """Classification with relative position context."""
+        context_prompts = [p + " The object is marked in the full image." for p in prompts]
+        return self.backend.generate(full_context_images, context_prompts)
+    
+    def classify_overlay(self, full_context_images_with_bbox: List[Image.Image], 
+                        prompts: List[str]) -> List[str]:
+        """Classification with bounding box overlay."""
+        overlay_prompts = [p + " The object is highlighted in the image with a red box." for p in prompts]
+        return self.backend.generate(full_context_images_with_bbox, overlay_prompts)
+    
+    def classify_twoview(self, crops: List[Image.Image], 
+                        full_contexts: List[Image.Image], 
+                        prompts: List[str]) -> List[str]:
+        """Classification with two-view context."""
+        image_pairs = [self.two_view_image(crop, context) 
+                      for crop, context in zip(crops, full_contexts)]
+        return self.backend.generate(image_pairs, prompts)
+    
+    def classify_batch(self, images: List[Image.Image], prompts: List[str]) -> List[str]:
+        """Batch classification of images."""
+        return self.backend.generate(images, prompts)
+    
+    def benchmark(self, test_cases: List[Dict[str, Any]], 
+                  methods: List[str] = None) -> Dict[str, Any]:
+        """Benchmark different classification methods.
+        
+        Args:
+            test_cases: List of test cases, each containing:
+                - image: PIL Image
+                - bbox: Optional[Tuple[int, int, int, int]]
+                - prompt: str
+            methods: List of methods to benchmark ("basic", "relativepos", "overlay", "twoview")
+                    Note: If bbox is not provided, only "basic" method will be used
+        
+        Returns:
+            Dictionary containing benchmark results.
+        """
+        if methods is None:
+            methods = ["basic", "relativepos", "overlay", "twoview"]
+        
+        results = {
+            "model": self.backend.get_name(),
+            "methods": {},
+            "timing": {}
+        }
+        
+        for method in methods:
+            method_results = []
+            method_times = []
+            
+            for case in test_cases:
+                image = case["image"]
+                bbox = case.get("bbox")  # Make bbox optional
+                prompt = case["prompt"]
+                
+                # Skip non-basic methods if no bbox is provided
+                if bbox is None and method != "basic":
+                    continue
+                
+                # Prepare inputs based on method
+                if bbox is not None:
+                    crop = image.crop(bbox)
+                    bbox_image = self.embed_box_on_image(image, bbox)
+                else:
+                    crop = image  # Use whole image if no bbox
+                    bbox_image = image
+                
+                start_time = time.time()
+                
+                result = None
+                if method == "basic":
+                    result = self.classify([(crop, prompt)])[0]
+                elif bbox is not None:  # Only execute these methods if bbox exists
+                    if method == "relativepos":
+                        result = self.classify_relativepos([crop], [bbox_image], [prompt])[0]
+                    elif method == "overlay":
+                        result = self.classify_overlay([bbox_image], [prompt])[0]
+                    elif method == "twoview":
+                        result = self.classify_twoview([crop], [image], [prompt])[0]
+                
+                end_time = time.time()
+                method_times.append(end_time - start_time)
+                
+                method_results.append({
+                    "prompt": prompt,
+                    "result": result,
+                    "time": end_time - start_time,
+                    "has_bbox": bbox is not None
+                })
+            
+            # Only add method results if there are any results for this method
+            if method_results:
+                results["methods"][method] = method_results
+                results["timing"][method] = {
+                    "avg": sum(method_times) / len(method_times),
+                    "min": min(method_times),
+                    "max": max(method_times)
+                }
+        
+        return results
+
+def test_vlm_comparison(image_path: str, bbox: Tuple[int, int, int, int], 
+                       prompt: str, save_dir: Optional[str] = None) -> None:
+    """Test and compare different VLM backends and classification methods.
+    
+    Args:
+        image_path: Path to the test image
+        bbox: Bounding box coordinates (x1, y1, x2, y2)
+        prompt: Base prompt for classification
+        save_dir: Optional directory to save results
+    """
+    # Load test image
+    image = Image.open(image_path)
+    
+    # Prepare test case
+    test_case = {
+        "image": image,
+        "bbox": bbox,
+        "prompt": prompt
+    }
+    
+    # Initialize backends
+    backends = [
+        HuggingFaceVLM("Salesforce/blip2-opt-2.7b"),
+        #HuggingFaceVLM("Salesforce/blip2-flan-t5-xl"),
+        # Uncomment to test with OpenAI (requires API key)
+        # OpenAIVLM(os.getenv("OPENAI_API_KEY"))
+    ]
+    
+    # Methods to test
+    methods = ["basic", "relativepos", "overlay", "twoview"]
+    
+    # Run benchmarks
+    all_results = {}
+    for backend in backends:
+        classifier = VLMClassifier(backend)
+        results = classifier.benchmark([test_case], methods)
+        all_results[backend.get_name()] = results
+    
+    # Save or print results
+    if save_dir:
+        os.makedirs(save_dir, exist_ok=True)
+        with open(os.path.join(save_dir, "vlm_comparison_results.json"), "w") as f:
+            json.dump(all_results, f, indent=2)
+    
+    # Print summary
+    print("\nVLM Comparison Results:")
+    for model_name, results in all_results.items():
+        print(f"\n{model_name}:")
+        for method, timing in results["timing"].items():
+            print(f"  {method}:")
+            print(f"    Average time: {timing['avg']:.3f}s")
+            print(f"    Result: {results['methods'][method][0]['result']}")
+
+def testBlip2():
+    # pip install accelerate
+    import torch
+    import requests
+    from PIL import Image
+    from transformers import Blip2Processor, Blip2ForConditionalGeneration
+
+    # Load BLIP-2 processor and model
+    processor = Blip2Processor.from_pretrained("Salesforce/blip2-opt-2.7b")
+    model = Blip2ForConditionalGeneration.from_pretrained(
+        "Salesforce/blip2-opt-2.7b",
+        torch_dtype=torch.float16,
+        device_map="auto"
+    )
+    model.eval()
+
+    # Load your image
+    img_path = "output/gcs_sources/Sweeper 19303/20250224/064224_000100.jpg"
+    image = Image.open(img_path).convert("RGB")
+
+    # Define your prompt (keep it concise and grounded in visual context)
+    prompt = "Does the image show dumped trash, glass, yard waste, or debris? If there is a trash container. Determine whether it is a residential bin or a commercial dumpster, and whether it is improperly placed—especially if it obstructs a bike lane or pedestrian path."
+
+    # Prepare inputs using the processor
+    inputs = processor(images=image, text=prompt, return_tensors="pt")
+    for k, v in inputs.items():
+        if v.dtype == torch.float:
+            inputs[k] = v.to(model.device, dtype=torch.float16)
+        else:
+            inputs[k] = v.to(model.device)
+
+    # Generate output
+    with torch.no_grad():
+        generated_ids = model.generate(
+            **inputs,
+            max_new_tokens=200,
+            min_length=5,
+            do_sample=True,
+            temperature=0.7,
+            top_k=50,
+            top_p=0.95,
+            no_repeat_ngram_size=2,
+            pad_token_id=processor.tokenizer.pad_token_id,
+            eos_token_id=processor.tokenizer.eos_token_id
+        )
+
+    # Decode result
+    output = processor.tokenizer.decode(generated_ids[0], skip_special_tokens=True)
+    print("🧠 Model Output:", output)
+
+def testBlip2_module():
+    import torch
+    from PIL import Image
+    from transformers import Blip2Processor, Blip2ForConditionalGeneration
+
+    # ---------- Setup ----------
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    processor = Blip2Processor.from_pretrained("Salesforce/blip2-opt-2.7b")
+    model = Blip2ForConditionalGeneration.from_pretrained(
+        "Salesforce/blip2-opt-2.7b",
+        torch_dtype=torch.float16 if device == "cuda" else torch.float32,
+        device_map="auto" if device == "cuda" else None
+    )
+    model.eval()
+
+    # ---------- Image Load ----------
+    img_path = "output/gcs_sources/Sweeper 19303/20250224/064224_000100.jpg"
+    image = Image.open(img_path).convert("RGB")
+
+    # ---------- Helper Function ----------
+    def generate_response(image, prompt, max_new_tokens=80):
+        inputs = processor(images=image, text=prompt, return_tensors="pt")
+        for k, v in inputs.items():
+            if v.dtype == torch.float: #'pixel_values'
+                inputs[k] = v.to(model.device, dtype=torch.float16)
+            else:#torch.int64
+                inputs[k] = v.to(model.device)
+
+        with torch.no_grad():
+            output_ids = model.generate(
+                **inputs,
+                max_new_tokens=max_new_tokens,
+                do_sample=True,
+                top_k=50,
+                top_p=0.95,
+                temperature=0.7,
+                no_repeat_ngram_size=2,
+                pad_token_id=processor.tokenizer.pad_token_id,
+                eos_token_id=processor.tokenizer.eos_token_id
+            )
+        return processor.tokenizer.decode(output_ids[0], skip_special_tokens=True).strip()
+
+    # ---------- Modular Prompts ----------
+    prompt_trash = (
+        "Does this image show dumped trash, broken glass, yard waste, or debris? "
+        "List all that apply or say 'none'."
+    )
+    prompt_container = (
+        "Is there a trash container in the image? If so, is it a residential bin or a commercial dumpster?"
+    )
+    prompt_placement = (
+        "Is the trash container placed improperly, such as blocking a bike lane or pedestrian path?"
+    )
+
+    # ---------- Run Model ----------
+    result = {
+        "trash_type": generate_response(image, prompt_trash),
+        "container_type": generate_response(image, prompt_container),
+        "improper_placement": generate_response(image, prompt_placement)
+    }
+
+    # ---------- Output ----------
+    print("🧾 Parsed Result:")
+    for k, v in result.items():
+        print(f"{k}: {v}")
+
+
+def test_multi_model_vlm(img_path):
+    """Test the enhanced HuggingFaceVLM backend with different model types."""
+    import os
+    from PIL import Image
+    
+    # Sample image path - adjust as needed
+    #img_path = "output/gcs_sources/Sweeper 19303/20250224/064224_000100.jpg"
+    if not os.path.exists(img_path):
+        print(f"Warning: Image path {img_path} not found. Using a sample image.")
+        # Create a simple test image if the specified path doesn't exist
+        img = Image.new('RGB', (512, 512), color='white')
+        draw = ImageDraw.Draw(img)
+        draw.rectangle([100, 100, 400, 400], outline='black', width=5)
+        draw.text((200, 250), "Test Image", fill='black')
+    else:
+        img = Image.open(img_path).convert("RGB")
+    
+    # Test prompt
+    prompt = "Describe what you see in this image."
+    
+    # Model configurations to test
+    # Note: Uncomment models as needed, but be aware of memory requirements
+    model_configs = [
+        # Default BLIP2 model
+        {"name": "Salesforce/blip2-opt-2.7b", "description": "BLIP2 (Default)"},
+        
+        # LLaVA models
+        # {"name": "llava-hf/llava-1.5-7b-hf", "description": "LLaVA 1.5 (7B)"},
+        {"name": "llava-hf/llava-v1.6-mistral-7b-hf", "description": "LLaVA 1.6 Mistral (7B)"},
+        
+        # SmolVLM models
+        {"name": "HuggingFaceTB/SmolVLM-Instruct", "description": "SmolVLM Instruct"},
+        
+        # Qwen models
+        {"name": "Qwen/Qwen2.5-VL-7B-Instruct", "description": "Qwen2.5-VL (7B)"},
+        
+        # MiniGPT-4 and GLIP would require additional setup
+        # {"name": "Vision-CAIR/MiniGPT-4", "description": "MiniGPT-4"},
+        #{"name": "GLIPModel/GLIP", "description": "GLIP"}
+    ]
+    
+    # Test each model configuration
+    results = {}
+    for config in model_configs:
+        print(f"\nTesting {config['description']} ({config['name']})...")
+        try:
+            # Initialize the model
+            vlm = HuggingFaceVLM(model_name=config['name'])
+            
+            # Generate response
+            start_time = time.time()
+            response = vlm.generate([img], [prompt])[0]
+            end_time = time.time()
+            
+            # Store results
+            results[config['description']] = {
+                "response": response,
+                "time": end_time - start_time
+            }
+            
+            # Print results
+            print(f"Response: {response}")
+            print(f"Time: {end_time - start_time:.2f} seconds")
+            
+        except Exception as e:
+            print(f"Error with {config['description']}: {str(e)}")
+            results[config['description']] = {"error": str(e)}
+    
+    return results
+
+# Example usage
+if __name__ == "__main__":
+    # Uncomment the test function you want to run
+    
+    # Test the enhanced multi-model VLM backend
+    test_multi_model_vlm(img_path="VisionLangAnnotateModels/sampledata/vehiclecrop.jpeg")
+    
+    # Test the original BLIP2 module
+    # testBlip2_module()
+    
+    # Test VLM comparison
+    # test_vlm_comparison(
+    #     image_path="output/gcs_sources/Sweeper 19303/20250224/064224_000100.jpg",
+    #     bbox=None,
+    #     prompt="Analyze the vehicle in the image. Is it abandoned, burned, blocking a bike lane, fire hydrant, or red curb? Is it missing parts like tires or windows, or up on jacks?",
+    #     save_dir="./results"
+    # )

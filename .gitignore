@@ -188,5 +188,9 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
-
+results
 output
+my_*
+*/my_*
+*/*/my_*
+*.json
