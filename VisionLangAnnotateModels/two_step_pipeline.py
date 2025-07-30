@@ -11,6 +11,7 @@ from typing import List, Dict, Any, Tuple, Optional, Union
 # Import the HuggingFaceVLM class from vlm_classifierv3.py
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from VisionLangAnnotateModels.VLM.vlm_classifierv3 import HuggingFaceVLM
+from VisionLangAnnotateModels.VLM.ollama_utils import process_with_ollama as ollama_utils_process_with_ollama
 
 
 def load_labelstudio_annotations(annotation_file: str) -> Dict[str, Any]:
@@ -297,6 +298,8 @@ def process_with_ollama(descriptions: List[str], step1_labels: List[str], image_
     Process VLM descriptions using a local Ollama model to standardize outputs.
     Processes all objects from a single image together to save processing time.
     
+    This function is now a wrapper around the implementation in ollama_utils.py.
+    
     Args:
         descriptions: List of VLM descriptions to process
         step1_labels: List of step1 detection labels corresponding to each description
@@ -307,195 +310,8 @@ def process_with_ollama(descriptions: List[str], step1_labels: List[str], image_
     Returns:
         List of dictionaries containing processed results
     """
-    if allowed_classes is None:
-        allowed_classes = [
-            "Car", "Truck", "Vehicle blocking bike lane", "Burned vehicle", "Police car", 
-            "Pedestrian", "Worker", "Street vendor", "Residential trash bin", "Commercial dumpster", 
-            "Street sign", "Construction sign", "Traffic signal light", "Broken traffic lights", 
-            "Tree", "Overhanging branch", "Dumped trash", "Yard waste", "Glass/debris", 
-            "Pothole", "Unclear bike lane markings", "Utility pole", "Downed bollard", 
-            "Cone", "Streetlight outage", "Graffiti", "Bench", "Vehicle in bike lane", 
-            "Bicycle", "Scooter", "Wheelchair", "Bus", "Train", "Ambulance", "Fire truck", "Other"
-        ]
-    
-    results = []
-    
-    # Ollama API endpoint
-    url = "http://localhost:11434/api/generate"
-    
-    # Group descriptions by image path
-    image_groups = {}
-    for i, (description, step1_label, image_path) in enumerate(zip(descriptions, step1_labels, image_paths)):
-        if image_path not in image_groups:
-            image_groups[image_path] = []
-        image_groups[image_path].append({
-            "index": i,
-            "description": description,
-            "step1_label": step1_label
-        })
-    
-    # Process each image's objects together
-    for image_path, objects in image_groups.items():
-        # Create a batch prompt for all objects in this image
-        objects_text = ""
-        for i, obj in enumerate(objects):
-            objects_text += f"Object {i+1} (Step1 label: {obj['step1_label']}):\n{obj['description']}\n\n"
-        
-        prompt = f"""Based on the following descriptions of objects detected in a single image, classify each object into one of these categories: {', '.join(allowed_classes)}.
-        
-        {objects_text}
-        Return a JSON array where each element corresponds to one of the objects above, in the same order. Each element should be a JSON object with the following structure:
-        {{
-            "class": "The most appropriate class from the allowed list",
-            "confidence": A number between 0 and 1 indicating your confidence,
-            "reasoning": "Brief explanation for your classification"
-        }}
-        
-        Only return the JSON array, nothing else."""
-        
-        try:
-            # Call Ollama API
-            response = requests.post(url, json={
-                "model": ollama_model,
-                "prompt": prompt,
-                "stream": False,
-                "format": "json"  # Request JSON format if the model supports it
-            }, timeout=60)  # Increased timeout for batch processing
-            
-            if response.status_code == 200:
-                # Parse the response
-                response_text = response.json().get("response", "")
-                
-                # Extract JSON from response (handling potential text before/after JSON)
-                try:
-                    # First try direct JSON parsing
-                    try:
-                        processed_results = json.loads(response_text)
-                        # Ensure we got an array
-                        if not isinstance(processed_results, list):
-                            # Try to find array in the response
-                            array_start = response_text.find('[')
-                            array_end = response_text.rfind(']')
-                            if array_start >= 0 and array_end >= 0 and array_end > array_start:
-                                json_str = response_text[array_start:array_end+1]
-                                processed_results = json.loads(json_str)
-                            else:
-                                raise ValueError("Response is not a JSON array")
-                    except (json.JSONDecodeError, ValueError):
-                        # If direct parsing fails, try to extract JSON from text
-                        array_start = response_text.find('[')
-                        array_end = response_text.rfind(']')
-                        
-                        if array_start >= 0 and array_end >= 0 and array_end > array_start:
-                            json_str = response_text[array_start:array_end+1]
-                            processed_results = json.loads(json_str)
-                        else:
-                            # If no valid JSON array found, create default responses
-                            raise ValueError("No valid JSON array found in response")
-                    
-                    # Validate and process each result
-                    if len(processed_results) != len(objects):
-                        print(f"Warning: Expected {len(objects)} results but got {len(processed_results)}. Padding or truncating as needed.")
-                    
-                    # Map results back to original indices
-                    for i, obj in enumerate(objects):
-                        if i < len(processed_results):
-                            result = processed_results[i]
-                            # Validate required fields
-                            if not all(k in result for k in ["class", "confidence", "reasoning"]):
-                                print(f"Warning: Missing required fields for object {i+1}. Using defaults.")
-                                result = {
-                                    "class": "Other",
-                                    "confidence": 0.5,
-                                    "reasoning": "Missing fields in Ollama response"
-                                }
-                            
-                            # Ensure the class is in the allowed list
-                            if result["class"] not in allowed_classes:
-                                closest_match = min(allowed_classes, key=lambda x: abs(len(x) - len(result["class"])))
-                                print(f"Warning: Class '{result['class']}' not in allowed list. Using '{closest_match}' instead.")
-                                result["class"] = closest_match
-                            
-                            # Ensure confidence is a float between 0 and 1
-                            try:
-                                confidence = float(result["confidence"])
-                                result["confidence"] = max(0.0, min(1.0, confidence))
-                            except (ValueError, TypeError):
-                                result["confidence"] = 0.7  # Default confidence
-                        else:
-                            # Create default result if we don't have enough results
-                            result = {
-                                "class": "Other",
-                                "confidence": 0.5,
-                                "reasoning": "No result provided by Ollama"
-                            }
-                        
-                        # Store result at the original index
-                        while len(results) <= obj["index"]:
-                            results.append(None)
-                        results[obj["index"]] = result
-                        
-                except Exception as e:
-                    # Fallback if JSON parsing or validation fails
-                    print(f"Error processing Ollama response: {str(e)}")
-                    # Create default results for all objects in this image
-                    for obj in objects:
-                        default_result = {
-                            "class": "Other",
-                            "confidence": 0.5,
-                            "reasoning": f"Failed to parse valid JSON from Ollama response: {str(e)}"
-                        }
-                        # Store result at the original index
-                        while len(results) <= obj["index"]:
-                            results.append(None)
-                        results[obj["index"]] = default_result
-            else:
-                # Handle API error
-                error_msg = f"Ollama API error: {response.status_code}"
-                print(error_msg)
-                # Create default results for all objects in this image
-                for obj in objects:
-                    default_result = {
-                        "class": "Other",
-                        "confidence": 0.5,
-                        "reasoning": error_msg
-                    }
-                    # Store result at the original index
-                    while len(results) <= obj["index"]:
-                        results.append(None)
-                    results[obj["index"]] = default_result
-        except requests.exceptions.Timeout:
-            # Handle timeout specifically
-            error_msg = f"Timeout while calling Ollama API (60s)"
-            print(error_msg)
-            # Create default results for all objects in this image
-            for obj in objects:
-                default_result = {
-                    "class": "Other",
-                    "confidence": 0.5,
-                    "reasoning": error_msg
-                }
-                # Store result at the original index
-                while len(results) <= obj["index"]:
-                    results.append(None)
-                results[obj["index"]] = default_result
-        except Exception as e:
-            # Handle connection or other errors
-            error_msg = f"Error calling Ollama: {str(e)}"
-            print(error_msg)
-            # Create default results for all objects in this image
-            for obj in objects:
-                default_result = {
-                    "class": "Other",
-                    "confidence": 0.5,
-                    "reasoning": error_msg
-                }
-                # Store result at the original index
-                while len(results) <= obj["index"]:
-                    results.append(None)
-                results[obj["index"]] = default_result
-    
-    return results
+    # Call the implementation from ollama_utils.py
+    return ollama_utils_process_with_ollama(descriptions, step1_labels, image_paths, ollama_model, allowed_classes)
 
 
 def run_three_step_pipeline(image_dir: str, annotation_file: str, model_name: str = "Salesforce/blip2-opt-2.7b", 
