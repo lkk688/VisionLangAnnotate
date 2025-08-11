@@ -1,7 +1,128 @@
 # VisionLangAnnotate
-vision and language model, open vocabulary output, deep learning inference, annotation, python backend, fine-tuning and continuous improvement
 
-## Repository Setup
+<p align="center">
+  <img src="https://img.shields.io/badge/Python-3.8%2B-blue" alt="Python Version">
+  <img src="https://img.shields.io/badge/License-MIT-green" alt="License">
+  <img src="https://img.shields.io/badge/Status-Active-brightgreen" alt="Status">
+</p>
+
+## 🔍 Overview
+
+VisionLangAnnotate is an advanced vision-language annotation framework that enables dynamic object detection and annotation based on natural language prompts. By combining traditional computer vision models with state-of-the-art Vision-Language Models (VLMs), it offers a flexible and powerful solution for object detection, segmentation, and annotation tasks.
+
+## ✨ Key Features
+
+- **Prompt-Driven Object Detection**: Detect objects based on natural language descriptions
+- **Multi-Model Integration**: Combines traditional object detectors with Vision-Language Models
+- **Dynamic Annotation**: Generate annotations on-the-fly based on user requests
+- **Video Processing**: Support for both image and video inputs
+- **Zero-Shot Capabilities**: Detect novel objects without prior training
+- **Unified API**: Simple interface for various detection and annotation tasks
+- **Label Studio Integration**: Export detection results to Label Studio compatible JSON format for human validation and re-annotation
+- **Complete Annotation Loop**: End-to-end pipeline from user requests to data pre-processing, object detection, vision annotation, and human validation
+
+## 🏗️ Architecture
+
+VisionLangAnnotate consists of two main components:
+
+### 1. Traditional Object Detection Pipeline
+
+Located in `VisionLangAnnotateModels/detectors/`, this component includes:
+
+- Multiple object detection models (DETR, YOLO, RT-DETR)
+- Video processing pipeline (`videopipeline.py`)
+- Ensemble detection capabilities
+- Evaluation tools and metrics
+
+### 2. Vision-Language Models (VLM) Pipeline
+
+Located in `VisionLangAnnotateModels/VLM/`, this component includes:
+
+- Zero-shot object detection with Grounding DINO and SAM (`groundingdinosam.py`)
+- Multi-model VLM pipeline (`vlmpipeline.py`)
+- Region captioning and classification
+- Support for various VLM providers (OpenAI, Ollama, vLLM, LiteLLM)
+
+### 3. Annotation and Validation Pipeline
+
+The project includes tools for exporting detection results to Label Studio:
+
+- Export detection results to Label Studio compatible JSON format (`export_to_label_studio.py`)
+- Integration with Google Cloud Storage for data management (`utils/labelstudiogcp.py`)
+- Complete workflow from automatic detection to human validation and re-annotation
+- Feedback loop for continuous model improvement based on validated annotations
+
+## 🚀 Usage Examples
+
+### Object Detection with Natural Language
+
+```python
+from VisionLangAnnotateModels.VLM.vlmpipeline import VLMPipeline
+
+pipeline = VLMPipeline()
+results = pipeline.detect_with_prompt(
+    image_path="sampledata/bus.jpg",
+    prompt="Find all vehicles and count how many people are visible"
+)
+
+# Visualize results
+pipeline.visualize_results(results, output_path="output.jpg")
+```
+
+### Zero-Shot Object Detection
+
+```python
+from VisionLangAnnotateModels.VLM.groundingdinosam import GroundingDinoSamDetector
+
+# Initialize the zero-shot detector
+detector = GroundingDinoSamDetector()
+
+# Detect objects based on text prompt
+results = detector.detect(
+    image_path="path/to/image.jpg",
+    text_prompt="Find a red car and a person wearing a hat"
+)
+```
+
+### Video Processing
+
+```python
+from VisionLangAnnotateModels.detectors.videopipeline import VideoPipeline
+
+# Initialize the video pipeline
+video_pipeline = VideoPipeline(detector_name="yolov8x")
+
+# Process a video file
+detections = video_pipeline.process_video(
+    video_path="path/to/video.mp4",
+    output_path="path/to/output.mp4"
+)
+```
+
+### Label Studio Export
+
+```python
+from VisionLangAnnotateModels.export_to_label_studio import export_detections_to_label_studio
+
+# Export detection results to Label Studio format
+export_detections_to_label_studio(
+    detections=results,
+    image_path="path/to/image.jpg",
+    output_path="label_studio_annotations.json"
+)
+
+# For GCP integration
+from VisionLangAnnotateModels.utils.labelstudiogcp import upload_to_gcs
+
+# Upload annotations to Google Cloud Storage
+upload_to_gcs(
+    local_file_path="label_studio_annotations.json",
+    bucket_name="your-bucket-name",
+    destination_blob_name="annotations/label_studio_annotations.json"
+)
+```
+
+## 🛠️ Repository Setup
 ```bash
 git clone https://github.com/lkk688/VisionLangAnnotate.git
 cd VisionLangAnnotate
@@ -86,25 +207,77 @@ gsutil ls "gs://roadsafetysource/Sweeper 19303/"
 gcloud auth application-default login
 ```
 
-## File Structure
+## VLM Backends
+Ollama installation: [ollama linux](https://ollama.com/download/linux)
+```bash
+curl -fsSL https://ollama.com/install.sh | sh
+ollama pull gpt-oss:20b
+ollama run gpt-oss:20b
+```
+Ollama exposes a Chat Completions-compatible API, so you can use the OpenAI SDK
 
-annotation-tool/
-├── backend/
-│   ├── src/
-│   │   ├── main.py         # FastAPI app
-│   │   └── api/            # API routes
-│   ├── requirements.txt
-│   └── Dockerfile
-├── frontend/
-│   ├── src/
-│   │   ├── App.jsx         # React app
-│   │   └── components/
-│   ├── package.json
-│   └── vite.config.js
-├── docs/
-│   ├── getting-started.md
-│   └── api-reference.md
-├── pyproject.toml          # Python packaging
-├── README.md
-├── .gitignore
-└── LICENSE
+## 🌐 Web Interface
+
+VisionLangAnnotate provides a modern web interface built with React and FastAPI:
+
+- **Backend**: FastAPI server with WebSocket support for real-time processing
+- **Frontend**: React-based UI with intuitive controls for uploading media and entering prompts
+- **API**: RESTful endpoints for programmatic access to all features
+
+### Starting the Web Interface
+
+```bash
+# Start the backend server
+uvicorn src.main:app --reload
+
+# In a separate terminal, start the frontend
+cd frontend
+npm run dev
+```
+
+Visit `http://localhost:5173` to access the web interface.
+
+## 📊 Evaluation and Metrics
+
+VisionLangAnnotate includes tools for evaluating detection performance:
+
+- Precision, Recall, and F1-score metrics
+- Visualization of detection results
+- Comparison between different models and approaches
+- Benchmark datasets and evaluation scripts
+
+## 🔄 Complete Annotation Loop
+
+VisionLangAnnotate creates a complete annotation workflow:
+
+1. **User Request**: Start with natural language prompts describing objects to detect
+2. **Data Pre-processing**: Prepare images or videos for detection
+3. **Automatic Detection**: Apply traditional detectors or VLMs based on the prompt
+4. **Result Export**: Generate Label Studio compatible JSON format
+5. **Human Validation**: Review and correct annotations in Label Studio
+6. **Feedback Integration**: Use validated annotations to improve models
+7. **Continuous Improvement**: Retrain or fine-tune models with validated data
+
+This closed-loop system combines the efficiency of automatic detection with the accuracy of human validation, creating a powerful tool for building high-quality annotated datasets.
+
+## 🤝 Contributing
+
+Contributions are welcome! Here's how you can help:
+
+1. Fork the repository
+2. Create a feature branch (`git checkout -b feature/amazing-feature`)
+3. Commit your changes (`git commit -m 'Add some amazing feature'`)
+4. Push to the branch (`git push origin feature/amazing-feature`)
+5. Open a Pull Request
+
+## 📄 License
+
+This project is licensed under the MIT License - see the LICENSE file for details.
+
+## 📞 Contact
+
+For questions or feedback, please open an issue on GitHub or contact the maintainers directly.
+
+---
+
+<p align="center">Built with ❤️ for the computer vision and AI community</p>

@@ -1,9 +1,37 @@
 import json
 import re
 import requests
-from typing import List, Dict, Any, Tuple, Optional, Union
+from typing import List, Dict, Any, Tuple, Optional, Union, Callable
 from PIL import Image
 import time
+
+
+def extract_ollama_response_text(response_data: Dict[str, Any]) -> str:
+    """
+    Extract the response text from an Ollama API response, handling both generate and chat API formats.
+    
+    Args:
+        response_data: The JSON response from the Ollama API
+        
+    Returns:
+        The extracted response text
+    """
+    # Check if this is a chat API response (which has a different structure)
+    if "message" in response_data and "content" in response_data["message"]:
+        # Chat API format: response is in message.content
+        response_text = response_data["message"]["content"]
+    else:
+        # Generate API format: response is in the response field
+        response_text = response_data.get("response", "")
+        
+    # Extract only the assistant's response if needed
+    if "assistant:" in response_text.lower():
+        response_text = re.split(r'assistant:', response_text, flags=re.IGNORECASE)[-1].strip()
+    # Handle Qwen [INST] format
+    elif "[/INST]" in response_text:
+        response_text = response_text.split("[/INST]")[-1].strip()
+        
+    return response_text
 
 # Default Ollama API endpoint (for older versions)
 DEFAULT_OLLAMA_API_URL = "http://localhost:11434/api/generate"
@@ -21,7 +49,7 @@ class OllamaClient:
     It handles API communication, error handling, and response parsing.
     """
     
-    def __init__(self, api_url: str = DEFAULT_OLLAMA_API_URL, chat_api_url: str = DEFAULT_OLLAMA_CHAT_API_URL, timeout: int = 60):
+    def __init__(self, api_url: str = DEFAULT_OLLAMA_API_URL, chat_api_url: str = DEFAULT_OLLAMA_CHAT_API_URL, timeout: int = 60, stream_callback: Optional[callable] = None):
         """
         Initialize the Ollama client.
         
@@ -29,16 +57,20 @@ class OllamaClient:
             api_url: URL of the Ollama API endpoint for generate requests
             chat_api_url: URL of the Ollama API endpoint for chat requests
             timeout: Timeout in seconds for API requests
+            stream_callback: Optional callback function for streaming responses. 
+                             The callback should accept a string chunk and return None.
         """
         self.api_url = api_url
         self.chat_api_url = chat_api_url
         self.timeout = timeout
+        self.stream_callback = stream_callback
     
     def process_text(self, 
                      prompt: str, 
                      model: str, 
                      format_json: bool = True,
-                     system_prompt: Optional[str] = None) -> Dict[str, Any]:
+                     system_prompt: Optional[str] = None,
+                     stream: bool = False) -> Dict[str, Any]:
         """
         Process text using a text-only Ollama LLM.
         
@@ -47,10 +79,18 @@ class OllamaClient:
             model: Name of the Ollama model to use (e.g., "llama3")
             format_json: Whether to request JSON format output
             system_prompt: Optional system prompt to set context
+            stream: Whether to stream the response (requires stream_callback to be set)
             
         Returns:
             Dictionary containing the processed result or error information
         """
+        # Check if streaming is requested but no callback is set
+        if stream and self.stream_callback is None:
+            return {
+                "success": False,
+                "error": "Stream callback must be set to use streaming"
+            }
+            
         try:
             # Prepare the request payload for the chat API
             chat_payload = {
@@ -61,7 +101,7 @@ class OllamaClient:
                         "content": prompt
                     }
                 ],
-                "stream": False
+                "stream": stream
             }
             
             # Add optional parameters
@@ -71,6 +111,11 @@ class OllamaClient:
             if system_prompt:
                 chat_payload["system"] = system_prompt
             
+            # For streaming responses
+            if stream:
+                return self._handle_streaming_request(chat_payload, is_chat=True, fallback_to_generate=True)
+            
+            # For non-streaming responses
             # Call Ollama Chat API first (preferred for newer models)
             try:
                 response = requests.post(
@@ -127,11 +172,8 @@ class OllamaClient:
                 # Parse the response
                 response_data = response.json()
                 
-                # Check if this is a chat API response (which has a different structure)
-                if "message" in response_data and "content" in response_data["message"]:
-                    response_text = response_data["message"]["content"]
-                else:
-                    response_text = response_data.get("response", "")
+                # Extract response text using the utility function
+                response_text = extract_ollama_response_text(response_data)
                 
                 print(f"DEBUG - Raw API response: {response_data}")
                 print(f"DEBUG - Extracted response text: {response_text}")
@@ -165,11 +207,105 @@ class OllamaClient:
                 "error": error_msg
             }
     
+    def _handle_streaming_request(self, payload: Dict[str, Any], is_chat: bool = True, fallback_to_generate: bool = True) -> Dict[str, Any]:
+        """
+        Handle streaming requests to Ollama API.
+        
+        Args:
+            payload: The request payload
+            is_chat: Whether to use the chat API (True) or generate API (False)
+            fallback_to_generate: Whether to fall back to generate API if chat API fails
+            
+        Returns:
+            Dictionary containing the processed result or error information
+        """
+        try:
+            # Ensure stream is set to True in the payload
+            payload["stream"] = True
+            
+            # Determine which API to use
+            api_url = self.chat_api_url if is_chat else self.api_url
+            
+            # Make the streaming request
+            with requests.post(api_url, json=payload, stream=True, timeout=self.timeout) as response:
+                if response.status_code != 200:
+                    # If chat API fails and fallback is enabled, try generate API
+                    if is_chat and fallback_to_generate:
+                        # Convert chat payload to generate payload if needed
+                        if "messages" in payload:
+                            # Extract prompt from messages
+                            messages = payload.get("messages", [])
+                            if messages and "content" in messages[0]:
+                                generate_payload = payload.copy()
+                                generate_payload["prompt"] = messages[0]["content"]
+                                del generate_payload["messages"]
+                                
+                                # Try again with generate API
+                                return self._handle_streaming_request(generate_payload, is_chat=False, fallback_to_generate=False)
+                    
+                    # Handle API error
+                    error_msg = f"Ollama API error: {response.status_code}"
+                    return {
+                        "success": False,
+                        "error": error_msg
+                    }
+                
+                # Process the streaming response
+                full_response = ""
+                for line in response.iter_lines():
+                    if line:
+                        # Parse the JSON line
+                        try:
+                            chunk = json.loads(line)
+                            
+                            # Extract the text chunk
+                            if is_chat and "message" in chunk and "content" in chunk["message"]:
+                                # Chat API format
+                                text_chunk = chunk["message"]["content"]
+                            else:
+                                # Generate API format
+                                text_chunk = chunk.get("response", "")
+                            
+                            # Call the callback with the chunk
+                            if self.stream_callback and text_chunk:
+                                self.stream_callback(text_chunk)
+                            
+                            # Append to full response
+                            full_response += text_chunk
+                            
+                        except json.JSONDecodeError:
+                            # Skip invalid JSON lines
+                            continue
+                
+                # Return the full response
+                return {
+                    "success": True,
+                    "response": full_response,
+                    "raw_response": {"response": full_response}  # Simplified raw response
+                }
+                
+        except requests.exceptions.Timeout:
+            # Handle timeout
+            error_msg = f"Timeout while streaming from Ollama API ({self.timeout}s)"
+            return {
+                "success": False,
+                "error": error_msg
+            }
+            
+        except Exception as e:
+            # Handle other errors
+            error_msg = f"Error streaming from Ollama: {str(e)}"
+            return {
+                "success": False,
+                "error": error_msg
+            }
+    
     def process_vision(self,
                       images: List[Image.Image],
                       prompts: List[str],
                       model: str,
-                      combined_prompt: Optional[str] = None) -> Dict[str, Any]:
+                      combined_prompt: Optional[str] = None,
+                      stream: bool = False) -> Dict[str, Any]:
         """
         Process images using a vision-capable Ollama LLM (e.g., Qwen2.5-VL).
         
@@ -182,6 +318,7 @@ class OllamaClient:
             prompts: List of text prompts corresponding to each image
             model: Name of the Ollama vision model to use (e.g., "qwen2.5-vl")
             combined_prompt: Optional combined prompt for batch processing
+            stream: Whether to stream the response (requires stream_callback to be set)
             
         Returns:
             Dictionary containing the processed results or error information
@@ -193,20 +330,27 @@ class OllamaClient:
                 "error": "Number of images must match number of prompts"
             }
         
+        # Check if streaming is requested but no callback is set
+        if stream and self.stream_callback is None:
+            return {
+                "success": False,
+                "error": "Stream callback must be set to use streaming"
+            }
+        
         try:
             # For single image processing
             if len(images) == 1:
-                return self._process_single_vision(images[0], prompts[0], model)
+                return self._process_single_vision(images[0], prompts[0], model, stream)
             
             # For multiple images
             if combined_prompt:
                 # Process as batch with combined prompt
-                return self._process_batch_vision(images, combined_prompt, model)
+                return self._process_batch_vision(images, combined_prompt, model, stream)
             else:
                 # Process each image individually and combine results
                 results = []
                 for i, (image, prompt) in enumerate(zip(images, prompts)):
-                    result = self._process_single_vision(image, prompt, model)
+                    result = self._process_single_vision(image, prompt, model, stream)
                     results.append(result)
                 
                 # Check if all were successful
@@ -238,7 +382,7 @@ class OllamaClient:
                 "error": error_msg
             }
     
-    def _process_single_vision(self, image: Image.Image, prompt: str, model: str) -> Dict[str, Any]:
+    def _process_single_vision(self, image: Image.Image, prompt: str, model: str, stream: bool = False) -> Dict[str, Any]:
         """
         Process a single image with a vision-capable Ollama model.
         
@@ -246,6 +390,7 @@ class OllamaClient:
             image: PIL Image object
             prompt: Text prompt for the image
             model: Name of the Ollama vision model
+            stream: Whether to stream the response (requires stream_callback to be set)
             
         Returns:
             Dictionary containing the processed result or error information
@@ -284,9 +429,14 @@ class OllamaClient:
                         "images": [img_base64]
                     }
                 ],
-                "stream": False
+                "stream": stream
             }
             
+            # For streaming responses
+            if stream:
+                return self._handle_streaming_request(chat_payload, is_chat=True, fallback_to_generate=True)
+            
+            # For non-streaming responses
             # Call Ollama Chat API first (preferred for vision models)
             try:
                 response = requests.post(
@@ -331,21 +481,8 @@ class OllamaClient:
                 # Parse the response
                 response_data = response.json()
                 
-                # Handle different response formats from chat vs generate API
-                if "message" in response_data:
-                    # This is a chat API response
-                    message = response_data.get("message", {})
-                    response_text = message.get("content", "")
-                else:
-                    # This is a generate API response
-                    response_text = response_data.get("response", "")
-                    
-                    # Extract only the assistant's response if needed
-                    if "assistant:" in response_text.lower():
-                        response_text = re.split(r'assistant:', response_text, flags=re.IGNORECASE)[-1].strip()
-                    # Handle Qwen [INST] format
-                    elif "[/INST]" in response_text:
-                        response_text = response_text.split("[/INST]")[-1].strip()
+                # Extract response text using the utility function
+                response_text = extract_ollama_response_text(response_data)
                 
                 return {
                     "success": True,
@@ -376,7 +513,7 @@ class OllamaClient:
                 "error": error_msg
             }
     
-    def _process_batch_vision(self, images: List[Image.Image], combined_prompt: str, model: str) -> Dict[str, Any]:
+    def _process_batch_vision(self, images: List[Image.Image], combined_prompt: str, model: str, stream: bool = False) -> Dict[str, Any]:
         """
         Process multiple images as a batch with a combined prompt.
         
@@ -384,6 +521,7 @@ class OllamaClient:
             images: List of PIL Image objects
             combined_prompt: Combined prompt for all images
             model: Name of the Ollama vision model
+            stream: Whether to stream the response (requires stream_callback to be set)
             
         Returns:
             Dictionary containing the processed result or error information
@@ -425,9 +563,14 @@ class OllamaClient:
                         "images": img_base64_list
                     }
                 ],
-                "stream": False
+                "stream": stream
             }
             
+            # For streaming responses
+            if stream:
+                return self._handle_streaming_request(chat_payload, is_chat=True, fallback_to_generate=True)
+            
+            # For non-streaming responses
             # Call Ollama Chat API first (preferred for vision models)
             try:
                 response = requests.post(
@@ -471,14 +614,9 @@ class OllamaClient:
             if response.status_code == 200:
                 # Parse the response
                 response_data = response.json()
-                response_text = response_data.get("response", "")
                 
-                # Extract only the assistant's response if needed
-                if "assistant:" in response_text.lower():
-                    response_text = re.split(r'assistant:', response_text, flags=re.IGNORECASE)[-1].strip()
-                # Handle Qwen [INST] format
-                elif "[/INST]" in response_text:
-                    response_text = response_text.split("[/INST]")[-1].strip()
+                # Extract response text using the utility function
+                response_text = extract_ollama_response_text(response_data)
                 
                 return {
                     "success": True,
@@ -516,7 +654,9 @@ def process_with_ollama_text(prompt: str,
                            system_prompt: Optional[str] = None,
                            api_url: str = DEFAULT_OLLAMA_API_URL,
                            chat_api_url: str = DEFAULT_OLLAMA_CHAT_API_URL,
-                           timeout: int = 60) -> Dict[str, Any]:
+                           timeout: int = 60,
+                           stream: bool = False,
+                           stream_callback: Optional[Callable[[str], None]] = None) -> Dict[str, Any]:
     """
     Process text using a text-only Ollama LLM.
     
@@ -528,12 +668,14 @@ def process_with_ollama_text(prompt: str,
         api_url: URL of the Ollama API endpoint for generate requests
         chat_api_url: URL of the Ollama API endpoint for chat requests
         timeout: Timeout in seconds for API requests
+        stream: Whether to stream the response
+        stream_callback: Callback function for streaming responses
         
     Returns:
         Dictionary containing the processed result or error information
     """
-    client = OllamaClient(api_url=api_url, chat_api_url=chat_api_url, timeout=timeout)
-    return client.process_text(prompt, ollama_model, format_json, system_prompt)
+    client = OllamaClient(api_url=api_url, chat_api_url=chat_api_url, timeout=timeout, stream_callback=stream_callback)
+    return client.process_text(prompt, ollama_model, format_json, system_prompt, stream=stream)
 
 
 def process_with_ollama_vision(images: List[Image.Image], 
@@ -542,7 +684,9 @@ def process_with_ollama_vision(images: List[Image.Image],
                              combined_prompt: Optional[str] = None,
                              api_url: str = DEFAULT_OLLAMA_API_URL,
                              chat_api_url: str = DEFAULT_OLLAMA_CHAT_API_URL,
-                             timeout: int = 60) -> Dict[str, Any]:
+                             timeout: int = 60,
+                             stream: bool = False,
+                             stream_callback: Optional[Callable[[str], None]] = None) -> Dict[str, Any]:
     """
     Process images using a vision-capable Ollama LLM.
     
@@ -554,19 +698,23 @@ def process_with_ollama_vision(images: List[Image.Image],
         api_url: URL of the Ollama API endpoint for generate requests
         chat_api_url: URL of the Ollama API endpoint for chat requests
         timeout: Timeout in seconds for API requests
+        stream: Whether to stream the response
+        stream_callback: Callback function for streaming responses
         
     Returns:
         Dictionary containing the processed results or error information
     """
-    client = OllamaClient(api_url=api_url, chat_api_url=chat_api_url, timeout=timeout)
-    return client.process_vision(images, prompts, ollama_model, combined_prompt)
+    client = OllamaClient(api_url=api_url, chat_api_url=chat_api_url, timeout=timeout, stream_callback=stream_callback)
+    return client.process_vision(images, prompts, ollama_model, combined_prompt, stream=stream)
 
 
 def process_with_ollama(descriptions: List[str], 
                        step1_labels: List[str], 
                        image_paths: List[str], 
                        ollama_model: str, 
-                       allowed_classes: List[str] = None) -> List[Dict[str, Any]]:
+                       allowed_classes: List[str] = None,
+                       stream: bool = False,
+                       stream_callback: Optional[Callable[[str], None]] = None) -> List[Dict[str, Any]]:
     """
     Process VLM descriptions using a local Ollama model to standardize outputs.
     Processes all objects from a single image together to save processing time.
@@ -577,6 +725,8 @@ def process_with_ollama(descriptions: List[str],
         image_paths: List of image paths corresponding to each description
         ollama_model: Name of the Ollama model to use (e.g., "llama3")
         allowed_classes: List of allowed class names for standardization
+        stream: Whether to stream the response
+        stream_callback: Callback function for streaming responses
         
     Returns:
         List of dictionaries containing processed results
@@ -632,7 +782,7 @@ def process_with_ollama(descriptions: List[str],
             object_prompt = f"Based on the following description of an object detected in an image, classify it into one of these categories: {', '.join(allowed_classes)}.\n\nObject (Step1 label: {obj['step1_label']}):\n{obj['description']}\n\nReturn a JSON object with the following structure:\n{{\n    \"class\": \"The most appropriate class from the allowed list\",\n    \"confidence\": A number between 0 and 1 indicating your confidence,\n    \"reasoning\": \"Brief explanation for your classification\"\n}}\n\nOnly return the JSON object, nothing else."
             
             # Use the text-only interface for this object
-            response = process_with_ollama_text(object_prompt, ollama_model, format_json=True)
+            response = process_with_ollama_text(object_prompt, ollama_model, format_json=True, stream=stream, stream_callback=stream_callback)
             
             if response["success"]:
                 response_text = response["response"]
@@ -813,15 +963,17 @@ if __name__ == "__main__":
     # Example 2: Process multiple images with process_with_ollama_vision
     # Load multiple images
     image_paths = [
-        image_path,  # Use the same image twice for demonstration
-        image_path
+        "/home/lkk/Developer/VisionLangAnnotate/VisionLangAnnotateModels/sampledata/bus.jpg", 
+        "/home/lkk/Developer/VisionLangAnnotate/VisionLangAnnotateModels/sampledata/064224_000100original.jpg",
+        "/home/lkk/Developer/VisionLangAnnotate/VisionLangAnnotateModels/sampledata/sjsupeople.jpg"
     ]
     images = [Image.open(path).convert("RGB") for path in image_paths]
     
     # Define prompts for each image
     prompts = [
         "Describe what you see in this image.",
-        "What objects are visible in this image?"
+        "What objects are visible in this image?",
+        "Describe what you see in this image.",
     ]
     
     # Process multiple images individually
@@ -840,7 +992,7 @@ if __name__ == "__main__":
         print(f"Error: {multi_result.get('error', 'Unknown error')}")
     
     # Example 3: Process multiple images with a combined prompt
-    combined_prompt = "Compare these two images and tell me what's similar and different between them."
+    combined_prompt = "Compare these images and tell me what's similar and different between them."
     
     # Process multiple images with a combined prompt
     batch_result = process_with_ollama_vision(
@@ -855,3 +1007,31 @@ if __name__ == "__main__":
         print(batch_result["response"])
     else:
         print(f"Error: {batch_result.get('error', 'Unknown error')}")
+    
+    # Example 4: Streaming text response
+    def stream_callback(chunk):
+        #print(f"Received chunk: {chunk}", end="", flush=True)
+        print(f"{chunk}", end="", flush=True)
+    
+    print("\nStreaming text response:")
+    stream_result = process_with_ollama_text(
+        prompt="Explain quantum computing in simple terms, step by step.",
+        ollama_model="llama3.2",
+        format_json=False,
+        stream=True,
+        stream_callback=stream_callback
+    )
+    
+    print("\n\nFinal streaming result success:", stream_result["success"])
+    
+    # Example 5: Streaming vision response
+    print("\nStreaming vision response:")
+    stream_vision_result = process_with_ollama_vision(
+        images=[image],  # Just use the first image
+        prompts=["Describe this image in detail, mentioning all visible elements."],
+        ollama_model="qwen2.5vl",
+        stream=True,
+        stream_callback=stream_callback
+    )
+    
+    print("\n\nFinal streaming vision result success:", stream_vision_result["success"])
