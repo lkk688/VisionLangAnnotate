@@ -122,6 +122,55 @@ upload_to_gcs(
 )
 ```
 
+## 🌆 Application: AI City Issue Detection System
+
+The **AI City Issue Detection System** is a real-time monitoring solution that leverages the **VisionLangAnnotate** framework to automatically detect and annotate urban issues from city camera streams. By combining traditional deep learning-based object detection with **Vision-Language Models (VLMs)**, the system can identify a wide range of urban problems through natural language prompts and generate detailed annotations to support rapid response and resolution.
+
+### 1. Data Acquisition Layer
+- **Camera Stream Integration**: Connects to existing city surveillance cameras and traffic monitoring systems.
+- **Video Processing Pipeline**: Extracts frames via scene change detection at configurable intervals for analysis and processes data in Google Cloud Storage buckets.
+- **Edge Computing Support**: Deploys lightweight models on edge devices for initial filtering.
+- **Privacy Protection**: Leverages deep learning models to automatically detect and blur human faces and license plate numbers in video streams.
+
+### 2. Detection and Analysis Layer
+- **Deep Learning-based Object Detection**: Identifies common urban objects such as vehicles, pedestrians, and infrastructure.
+  - YOLO-based detectors for real-time performance.
+  - DETR models for complex scene understanding.
+  - Ensemble approaches to improve accuracy.
+- **Vision-Language Model Processing**:
+  - Zero-shot detection using Grounding DINO + SAM for novel issue types, with SAM providing precise object segmentation.
+  - Natural language prompt processing (e.g., "Find potholes", "Detect broken streetlights") with VLM validation of detected object types, generation of detailed issue descriptions, and output in structured format for followup processing.
+  - Region captioning to describe detected issues in detail.
+
+### 3. Issue Classification and Prioritization
+- **Issue Type Categorization**:
+  - Infrastructure damage (e.g., potholes, cracks, broken facilities).
+  - Traffic violations (e.g., illegal parking, wrong-way driving).
+  - Safety hazards (e.g., fallen trees, flooding, debris).
+  - Public space misuse (e.g., illegal dumping, graffiti).
+- **Severity Assessment**:
+  - Automatically prioritizes issues based on safety impact.
+  - Tracks conditions over time to detect deterioration.
+
+### 4. Annotation and Validation Loop
+- **Automatic Annotation Generation**:
+  - Generates bounding boxes and segmentation masks for detected issues.
+  - Produces descriptive captions using VLMs.
+  - Attaches metadata including location, timestamp, and severity.
+- **Label Studio Integration**:
+  - Exports annotations in Label Studio-compatible JSON format.
+  - Supports human expert validation and correction workflow.
+  - Incorporates a feedback loop for continuous model improvement.
+
+### 5. Response and Monitoring System
+- **Real-Time Alerts**:
+  - Sends notifications for high-priority issues.
+  - Integrates with city maintenance and management systems.
+- **Issue Tracking Dashboard**:
+  - Visualizes detected issues on a city map.
+  - Supports historical data analysis and trend identification.
+  - Tracks performance metrics and response times.
+
 ## 🛠️ Repository Setup
 ```bash
 git clone https://github.com/lkk688/VisionLangAnnotate.git
