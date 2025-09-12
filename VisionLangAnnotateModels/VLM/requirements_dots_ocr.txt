@@ -1,0 +1,16 @@
+# Requirements for DotsOCR Pipeline
+# Core dependencies
+torch>=2.0.0
+transformers>=4.35.0
+Pillow>=9.0.0
+numpy>=1.21.0
+
+# PDF processing
+PyMuPDF>=1.23.0  # fitz for PDF handling
+
+# Optional dependencies for rendering
+markdown>=3.4.0
+weasyprint>=59.0  # For HTML to PDF conversion
+
+# Additional utilities
+pathlib2>=2.3.0  # For older Python versions if needed

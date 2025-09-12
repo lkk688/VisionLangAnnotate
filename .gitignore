@@ -194,3 +194,5 @@ my_*
 */my_*
 */*/my_*
 *.json
+qwen_detection_results
+ocr_results

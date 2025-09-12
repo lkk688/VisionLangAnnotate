@@ -1,0 +1,25 @@
+# Requirements for Qwen Math OCR Pipeline
+# Install with: pip install -r requirements_qwen_math_ocr.txt
+
+# Core ML libraries
+torch>=2.0.0
+torchvision>=0.15.0
+transformers>=4.37.0
+
+# Qwen VL utilities
+qwen-vl-utils>=0.0.2
+
+# Image processing
+Pillow>=9.0.0
+
+# Additional utilities
+numpy>=1.21.0
+requests>=2.25.0
+
+# Optional: For better performance
+# flash-attn>=2.0.0  # Uncomment if you have compatible GPU
+# accelerate>=0.20.0  # For better model loading
+
+# Development and testing (optional)
+# pytest>=7.0.0
+# jupyter>=1.0.0
