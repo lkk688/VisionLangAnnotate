@@ -16,6 +16,28 @@ import torch
 from torchvision.utils import draw_bounding_boxes
 from torchvision.transforms.functional import to_pil_image, pil_to_tensor
 
+# Traditional object detection imports
+try:
+    from ultralytics import YOLO
+    YOLO_AVAILABLE = True
+except ImportError:
+    YOLO_AVAILABLE = False
+    print("Warning: Ultralytics YOLO not available. Install with: pip install ultralytics")
+
+try:
+    from transformers import DetrImageProcessor, DetrForObjectDetection, AutoProcessor, AutoModelForObjectDetection
+    DETR_AVAILABLE = True
+except ImportError:
+    DETR_AVAILABLE = False
+    print("Warning: DETR models not available. Install transformers for DETR support.")
+
+try:
+    from ensemble_boxes import nms, weighted_boxes_fusion
+    ENSEMBLE_AVAILABLE = True
+except ImportError:
+    ENSEMBLE_AVAILABLE = False
+    print("Warning: ensemble-boxes not available. Install with: pip install ensemble-boxes")
+
 # SAM imports
 try:
     from transformers import SamProcessor, SamModel
@@ -37,6 +59,305 @@ except ImportError:
         sys.path.append(os.path.dirname(os.path.abspath(__file__)))
         from vlm_classifierv4 import HuggingFaceVLM
 
+# Traditional Object Detector Classes
+class YOLOv8Detector:
+    """YOLOv8 object detector using Ultralytics."""
+    
+    def __init__(self, model_path="yolov8x.pt"):
+        if not YOLO_AVAILABLE:
+            raise ImportError("Ultralytics YOLO not available. Install with: pip install ultralytics")
+        self.model = YOLO(model_path)
+    
+    def detect(self, image):
+        """Detect objects in image and return detections."""
+        results = self.model(image)
+        detections = []
+        for r in results:
+            if r.boxes is not None:
+                for i, box in enumerate(r.boxes.xyxy.cpu().numpy()):
+                    cls = int(r.boxes.cls[i].item())
+                    label = self.model.names[cls]
+                    conf = r.boxes.conf[i].item()
+                    detections.append({
+                        "bbox": box.tolist(), 
+                        "label": label, 
+                        "confidence": conf
+                    })
+        return detections
+
+class DETRDetector:
+    """DETR object detector using Transformers."""
+    
+    def __init__(self, model_name="facebook/detr-resnet-50", threshold=0.3):
+        if not DETR_AVAILABLE:
+            raise ImportError("DETR models not available. Install transformers for DETR support.")
+        self.processor = DetrImageProcessor.from_pretrained(model_name)
+        self.model = DetrForObjectDetection.from_pretrained(model_name)
+        self.model.eval()
+        self.threshold = threshold
+    
+    def detect(self, image):
+        """Detect objects in image and return detections."""
+        inputs = self.processor(images=image, return_tensors="pt")
+        with torch.no_grad():
+            outputs = self.model(**inputs)
+        
+        target_sizes = torch.tensor([image.size[::-1]])  # (height, width)
+        results = self.processor.post_process_object_detection(
+            outputs, target_sizes=target_sizes, threshold=self.threshold
+        )[0]
+        
+        detections = []
+        for score, label, box in zip(results["scores"], results["labels"], results["boxes"]):
+            box = box.tolist()  # [x0, y0, x1, y1]
+            label_str = self.model.config.id2label[label.item()].lower()
+            detections.append({
+                "bbox": box,
+                "label": label_str,
+                "confidence": score.item()
+            })
+        return detections
+
+class RTDETRDetector:
+    """RT-DETR object detector using Transformers."""
+    
+    def __init__(self, model_name="SenseTime/deformable-detr", threshold=0.3):
+        if not DETR_AVAILABLE:
+            raise ImportError("DETR models not available. Install transformers for DETR support.")
+        self.processor = AutoProcessor.from_pretrained(model_name)
+        self.model = AutoModelForObjectDetection.from_pretrained(model_name)
+        self.model.eval()
+        self.threshold = threshold
+    
+    def detect(self, image):
+        """Detect objects in image and return detections."""
+        inputs = self.processor(images=image, return_tensors="pt")
+        with torch.no_grad():
+            outputs = self.model(**inputs)
+        
+        target_sizes = torch.tensor([image.size[::-1]])  # (height, width)
+        results = self.processor.post_process_object_detection(
+            outputs, target_sizes=target_sizes, threshold=self.threshold
+        )[0]
+        
+        detections = []
+        for score, label, box in zip(results["scores"], results["labels"], results["boxes"]):
+            label_str = self.model.config.id2label[label.item()].lower()
+            detections.append({
+                "bbox": box.tolist(),
+                "label": label_str,
+                "confidence": score.item()
+            })
+        return detections
+
+# Ensemble and Box Optimization Functions
+def ensemble_detections(detection_lists, iou_thr=0.5, method='nms'):
+    """Ensemble multiple detection results using NMS or WBF."""
+    if not ENSEMBLE_AVAILABLE:
+        print("Warning: ensemble-boxes not available. Using simple concatenation.")
+        # Simple concatenation fallback
+        all_detections = []
+        for dets in detection_lists:
+            all_detections.extend(dets)
+        return all_detections
+    
+    if not detection_lists or all(len(dets) == 0 for dets in detection_lists):
+        return []
+    
+    if method == 'wbf':
+        return _wbf_ensemble_detections(detection_lists, iou_thr)
+    else:
+        return _nms_ensemble_detections(detection_lists, iou_thr)
+
+def _nms_ensemble_detections(detection_lists, iou_thr=0.5):
+    """Ensemble detections using Non-Maximum Suppression."""
+    boxes, scores, labels = [], [], []
+    for dets in detection_lists:
+        for d in dets:
+            boxes.append(d["bbox"])
+            scores.append(d["confidence"])
+            labels.append(d["label"])
+    
+    if not boxes:
+        return []
+    
+    # Normalize boxes for ensemble-boxes (assumes max dimension of 1024)
+    boxes = np.array(boxes)
+    scores = np.array(scores)
+    labels = np.array(labels)
+    
+    # Get image dimensions from first box (rough estimate)
+    max_coord = np.max(boxes)
+    norm_factor = max(max_coord, 1024)
+    
+    boxes = boxes / norm_factor
+    boxes_list = [boxes.tolist()]
+    scores_list = [scores.tolist()]
+    labels_list = [[label] for label in labels]
+    
+    ensembled_boxes, ensembled_scores, ensembled_labels = nms(
+        boxes_list, scores_list, labels_list, iou_thr=iou_thr
+    )
+    
+    # Re-scale boxes
+    ensembled_boxes = (np.array(ensembled_boxes) * norm_factor).tolist()
+    return [
+        {"bbox": b, "label": l[0], "confidence": s}
+        for b, s, l in zip(ensembled_boxes, ensembled_scores, ensembled_labels)
+    ]
+
+def _wbf_ensemble_detections(detection_lists, iou_thr=0.5, skip_box_thr=0.3):
+    """Ensemble detections using Weighted Boxes Fusion."""
+    boxes_list, scores_list, labels_list = [], [], []
+    
+    # Get normalization factor from all boxes
+    all_boxes = []
+    for dets in detection_lists:
+        for d in dets:
+            all_boxes.extend(d["bbox"])
+    
+    if not all_boxes:
+        return []
+    
+    norm_factor = max(max(all_boxes), 1024)
+    
+    for detections in detection_lists:
+        boxes, scores, labels = [], [], []
+        for d in detections:
+            x1, y1, x2, y2 = d["bbox"]
+            boxes.append([x1 / norm_factor, y1 / norm_factor, x2 / norm_factor, y2 / norm_factor])
+            scores.append(d["confidence"])
+            labels.append(d["label"])
+        boxes_list.append(boxes)
+        scores_list.append(scores)
+        labels_list.append(labels)
+    
+    if not any(boxes_list):
+        return []
+    
+    boxes, scores, labels = weighted_boxes_fusion(
+        boxes_list, scores_list, labels_list,
+        iou_thr=iou_thr, skip_box_thr=skip_box_thr
+    )
+    
+    results = []
+    for b, s, l in zip(boxes, scores, labels):
+        x1, y1, x2, y2 = [coord * norm_factor for coord in b]
+        results.append({
+            "bbox": [x1, y1, x2, y2],
+            "confidence": s,
+            "label": l
+        })
+    return results
+
+def optimize_boxes_for_vlm(detections, min_box_size=30, merge_threshold=0.3, max_boxes=20):
+    """Optimize bounding boxes for VLM processing by merging small/nearby boxes."""
+    if not detections:
+        return detections
+    
+    # Filter out very small boxes (less aggressive filtering)
+    filtered_detections = []
+    for det in detections:
+        x1, y1, x2, y2 = det["bbox"]
+        width, height = x2 - x1, y2 - y1
+        # Keep boxes that meet minimum size requirements (OR instead of AND for less aggressive filtering)
+        if width >= min_box_size or height >= min_box_size:
+            filtered_detections.append(det)
+    
+    if len(filtered_detections) <= max_boxes:
+        return filtered_detections
+    
+    # Sort by confidence and take top boxes
+    filtered_detections.sort(key=lambda x: x["confidence"], reverse=True)
+    
+    # Try to merge nearby boxes
+    merged_detections = []
+    used_indices = set()
+    
+    for i, det1 in enumerate(filtered_detections):
+        if i in used_indices:
+            continue
+        
+        # Find nearby boxes to merge
+        boxes_to_merge = [det1]
+        used_indices.add(i)
+        
+        for j, det2 in enumerate(filtered_detections[i+1:], i+1):
+            if j in used_indices:
+                continue
+            
+            if _should_merge_boxes(det1["bbox"], det2["bbox"], merge_threshold):
+                boxes_to_merge.append(det2)
+                used_indices.add(j)
+        
+        # Merge boxes if multiple found
+        if len(boxes_to_merge) > 1:
+            merged_box = _merge_multiple_boxes(boxes_to_merge)
+            merged_detections.append(merged_box)
+        else:
+            merged_detections.append(det1)
+        
+        if len(merged_detections) >= max_boxes:
+            break
+    
+    return merged_detections[:max_boxes]
+
+def _should_merge_boxes(bbox1, bbox2, threshold=0.3):
+    """Check if two boxes should be merged based on IoU or proximity."""
+    x1_1, y1_1, x2_1, y2_1 = bbox1
+    x1_2, y1_2, x2_2, y2_2 = bbox2
+    
+    # Calculate IoU
+    intersection_x1 = max(x1_1, x1_2)
+    intersection_y1 = max(y1_1, y1_2)
+    intersection_x2 = min(x2_1, x2_2)
+    intersection_y2 = min(y2_1, y2_2)
+    
+    if intersection_x2 <= intersection_x1 or intersection_y2 <= intersection_y1:
+        intersection_area = 0
+    else:
+        intersection_area = (intersection_x2 - intersection_x1) * (intersection_y2 - intersection_y1)
+    
+    area1 = (x2_1 - x1_1) * (y2_1 - y1_1)
+    area2 = (x2_2 - x1_2) * (y2_2 - y1_2)
+    union_area = area1 + area2 - intersection_area
+    
+    iou = intersection_area / union_area if union_area > 0 else 0
+    
+    # Also check proximity (boxes that are very close)
+    center1_x, center1_y = (x1_1 + x2_1) / 2, (y1_1 + y2_1) / 2
+    center2_x, center2_y = (x1_2 + x2_2) / 2, (y1_2 + y2_2) / 2
+    
+    avg_width = ((x2_1 - x1_1) + (x2_2 - x1_2)) / 2
+    avg_height = ((y2_1 - y1_1) + (y2_2 - y1_2)) / 2
+    
+    distance = ((center1_x - center2_x) ** 2 + (center1_y - center2_y) ** 2) ** 0.5
+    proximity_threshold = min(avg_width, avg_height) * 0.5
+    
+    return iou > threshold or distance < proximity_threshold
+
+def _merge_multiple_boxes(detections):
+    """Merge multiple detection boxes into one."""
+    if len(detections) == 1:
+        return detections[0]
+    
+    # Find bounding box that encompasses all
+    x1_min = min(det["bbox"][0] for det in detections)
+    y1_min = min(det["bbox"][1] for det in detections)
+    x2_max = max(det["bbox"][2] for det in detections)
+    y2_max = max(det["bbox"][3] for det in detections)
+    
+    # Use highest confidence and combine labels
+    max_conf_det = max(detections, key=lambda x: x["confidence"])
+    labels = [det["label"] for det in detections]
+    unique_labels = list(set(labels))
+    
+    return {
+        "bbox": [x1_min, y1_min, x2_max, y2_max],
+        "label": "/".join(unique_labels),
+        "confidence": max_conf_det["confidence"]
+    }
+
 class QwenObjectDetectionPipeline:
     """
     A robust object detection pipeline using Qwen2.5-VL model.
@@ -53,7 +374,9 @@ class QwenObjectDetectionPipeline:
                  model_name: str = "Qwen/Qwen2.5-VL-7B-Instruct",
                  device: str = "cuda",
                  output_dir: str = "./object_detection_results",
-                 enable_sam: bool = False):
+                 enable_sam: bool = False,
+                 enable_traditional_detectors: bool = False,
+                 traditional_detectors: List[str] = None):
         """Initialize the object detection pipeline.
         
         Args:
@@ -61,15 +384,23 @@ class QwenObjectDetectionPipeline:
             device: Device to run the model on (cuda/cpu)
             output_dir: Directory to save results
             enable_sam: Whether to enable SAM segmentation capabilities
+            enable_traditional_detectors: Whether to enable traditional object detectors
+            traditional_detectors: List of traditional detectors to use ['yolo', 'detr', 'rtdetr']
         """
         self.model_name = model_name
         self.device = device
         self.output_dir = output_dir
         self.enable_sam = enable_sam and SAM_AVAILABLE
+        self.enable_traditional_detectors = enable_traditional_detectors
         
         # Initialize the VLM model
         print(f"Initializing {model_name}...")
         self.vlm = HuggingFaceVLM(model_name=model_name, device=device)
+        
+        # Initialize traditional detectors if enabled
+        self.traditional_detectors = []
+        if self.enable_traditional_detectors and traditional_detectors:
+            self._initialize_traditional_detectors(traditional_detectors)
         
         # Initialize SAM if enabled
         self.sam_processor = None
@@ -86,6 +417,40 @@ class QwenObjectDetectionPipeline:
         
         # Create output directories
         self._setup_output_directories()
+    
+    def _initialize_traditional_detectors(self, detector_names: List[str]):
+        """Initialize traditional object detectors."""
+        for detector_name in detector_names:
+            try:
+                if detector_name.lower() == 'yolo':
+                    if YOLO_AVAILABLE:
+                        detector = YOLOv8Detector(model_path="yolov8x.pt")
+                        self.traditional_detectors.append(detector)
+                        print(f"Initialized YOLOv8 detector")
+                    else:
+                        print(f"Warning: YOLO not available, skipping")
+                
+                elif detector_name.lower() == 'detr':
+                    if DETR_AVAILABLE:
+                        detector = DETRDetector(model_name="facebook/detr-resnet-50")
+                        self.traditional_detectors.append(detector)
+                        print(f"Initialized DETR detector")
+                    else:
+                        print(f"Warning: DETR not available, skipping")
+                
+                elif detector_name.lower() == 'rtdetr':
+                    if DETR_AVAILABLE:
+                        detector = RTDETRDetector(model_name="SenseTime/deformable-detr")
+                        self.traditional_detectors.append(detector)
+                        print(f"Initialized RT-DETR detector")
+                    else:
+                        print(f"Warning: RT-DETR not available, skipping")
+                
+                else:
+                    print(f"Warning: Unknown detector '{detector_name}', skipping")
+            
+            except Exception as e:
+                print(f"Warning: Failed to initialize {detector_name} detector: {e}")
         
         # Object detection prompt template
         self.detection_prompt = (
@@ -458,6 +823,23 @@ class QwenObjectDetectionPipeline:
         
         return blurred_image
     
+    def _normalize_bbox(self, bbox):
+        """
+        Normalize bbox to dictionary format from either list or dict format.
+        
+        Args:
+            bbox: Either [x1, y1, x2, y2] list or {'x1': x1, 'y1': y1, 'x2': x2, 'y2': y2} dict
+            
+        Returns:
+            Dictionary with keys x1, y1, x2, y2
+        """
+        if isinstance(bbox, list) and len(bbox) == 4:
+            return {'x1': bbox[0], 'y1': bbox[1], 'x2': bbox[2], 'y2': bbox[3]}
+        elif isinstance(bbox, dict):
+            return bbox
+        else:
+            return {}
+    
     def _detect_faces_and_plates(self, objects: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
         """
         Identify faces and license plates from detected objects for privacy protection.
@@ -471,9 +853,22 @@ class QwenObjectDetectionPipeline:
         faces = []
         license_plates = []
         
+        # Handle invalid input
+        if not objects or objects is None:
+            return faces, license_plates
+            
+        # Handle tuple input like ([], None)
+        if isinstance(objects, tuple):
+            objects = objects[0] if objects[0] is not None else []
+        
         for obj in objects:
-            label = obj.get('label', '').lower()
-            description = obj.get('description', '').lower()
+            # Handle both dictionary and list objects
+            if isinstance(obj, dict):
+                label = obj.get('label', '').lower()
+                description = obj.get('description', '').lower()
+            else:
+                # Skip non-dictionary objects
+                continue
             
             # Check for faces
             if ('face' in label or 'person' in label or 'pedestrian' in label or 
@@ -514,7 +909,7 @@ class QwenObjectDetectionPipeline:
         # Apply blurring to faces
         if blur_faces:
             for face in faces:
-                bbox = face.get('bbox', {})
+                bbox = self._normalize_bbox(face.get('bbox', {}))
                 if bbox and all(key in bbox for key in ['x1', 'y1', 'x2', 'y2']):
                     x1, y1, x2, y2 = bbox['x1'], bbox['y1'], bbox['x2'], bbox['y2']
                     image = self._blur_region(image, x1, y1, x2, y2, blur_strength=25)
@@ -522,7 +917,7 @@ class QwenObjectDetectionPipeline:
         # Apply blurring to license plates
         if blur_plates:
             for plate in license_plates:
-                bbox = plate.get('bbox', {})
+                bbox = self._normalize_bbox(plate.get('bbox', {}))
                 if bbox and all(key in bbox for key in ['x1', 'y1', 'x2', 'y2']):
                     x1, y1, x2, y2 = bbox['x1'], bbox['y1'], bbox['x2'], bbox['y2']
                     image = self._blur_region(image, x1, y1, x2, y2, blur_strength=20)
@@ -557,7 +952,21 @@ class QwenObjectDetectionPipeline:
         annotations = []
         
         for i, obj in enumerate(objects):
-            x1, y1, x2, y2 = obj['bbox']
+            # Skip invalid objects (empty lists, None, or non-dict objects)
+            if not obj or not isinstance(obj, dict) or 'bbox' not in obj:
+                continue
+                
+            bbox = obj['bbox']
+            # Handle both list and dict bbox formats
+            if isinstance(bbox, list) and len(bbox) >= 4:
+                x1, y1, x2, y2 = bbox[:4]
+            elif isinstance(bbox, dict) and all(key in bbox for key in ['x1', 'y1', 'x2', 'y2']):
+                x1, y1, x2, y2 = bbox['x1'], bbox['y1'], bbox['x2'], bbox['y2']
+            else:
+                continue  # Skip objects with invalid bbox format
+                
+            # Get label with fallback
+            label = obj.get('label', obj.get('class', 'unknown'))
             
             # Convert to Label Studio format (percentages)
             x_percent = (x1 / image_width) * 100
@@ -574,7 +983,7 @@ class QwenObjectDetectionPipeline:
                     "width": width_percent,
                     "height": height_percent,
                     "rotation": 0,
-                    "rectanglelabels": [obj['label']]
+                    "rectanglelabels": [label]
                 },
                 "to_name": "image",
                 "from_name": "label",
@@ -630,6 +1039,10 @@ class QwenObjectDetectionPipeline:
         colors = ['red', 'blue', 'green', 'yellow', 'purple', 'orange', 'pink', 'brown']
         
         for i, obj in enumerate(objects):
+            # Skip invalid objects (empty lists, None, non-dict objects, or those without 'bbox')
+            if not obj or not isinstance(obj, dict) or 'bbox' not in obj:
+                continue
+                
             x1, y1, x2, y2 = obj['bbox']
             color = colors[i % len(colors)]
             
@@ -775,7 +1188,181 @@ class QwenObjectDetectionPipeline:
                 print(f"  - SAM Segmentation: {segmentation_visualization_path}")
         
         return results
-    
+
+    def detect_objects_hybrid(self, image_path: str, save_results: bool = True, apply_privacy: bool = True, 
+                            use_sam_segmentation: bool = False, ensemble_method: str = 'nms', 
+                            box_merge_threshold: float = 0.3) -> Dict[str, Any]:
+        """
+        Perform hybrid object detection combining traditional detectors with Qwen2.5-VL.
+        
+        This method:
+        1. First runs traditional object detectors (YOLO, DETR, RT-DETR) if enabled
+        2. Ensembles and optimizes the traditional detection results
+        3. Uses Qwen2.5-VL for detailed analysis of detected regions
+        4. Combines results for comprehensive object detection
+        
+        Args:
+            image_path: Path to the input image
+            save_results: Whether to save results to files
+            apply_privacy: Whether to apply privacy protection (blur faces/plates)
+            use_sam_segmentation: Whether to apply SAM segmentation post-processing
+            ensemble_method: Method for ensembling traditional detectors ('nms' or 'wbf')
+            box_merge_threshold: Threshold for merging nearby/overlapping boxes
+            
+        Returns:
+            Dictionary containing detection results and file paths
+        """
+        print(f"Processing image with hybrid detection: {image_path}")
+        
+        # Load image
+        try:
+            image = Image.open(image_path).convert('RGB')
+            image_width, image_height = image.size
+        except Exception as e:
+            raise ValueError(f"Error loading image {image_path}: {str(e)}")
+        
+        start_time = time.time()
+        all_objects = []
+        
+        # Step 1: Run traditional detectors if enabled
+        if self.enable_traditional_detectors and self.traditional_detectors:
+            print("Running traditional object detectors...")
+            traditional_detections = []
+            
+            for detector in self.traditional_detectors:
+                try:
+                    detections = detector.detect(image)
+                    traditional_detections.append(detections)
+                    print(f"  {detector.__class__.__name__}: {len(detections)} detections")
+                except Exception as e:
+                    print(f"  Warning: {detector.__class__.__name__} failed: {str(e)}")
+                    continue
+            
+        # Step 2: Run Qwen2.5-VL for comprehensive analysis
+        print("Running Qwen2.5-VL for detailed analysis...")
+        vlm_detections = []
+        try:
+            responses = self.vlm.generate([image], [self.detection_prompt])
+            raw_response = responses[0] if responses else ""
+            
+            # Parse VLM response
+            vlm_objects = self._parse_detection_response(raw_response, image_width, image_height)
+            
+            # Convert VLM objects to detection format for ensemble
+            for obj in vlm_objects:
+                vlm_detections.append({
+                    'label': obj['label'],
+                    'bbox': obj['bbox'],
+                    'confidence': obj.get('confidence', 0.8),  # Default confidence for VLM
+                    'source': 'vlm'
+                })
+                
+        except Exception as e:
+            print(f"Warning: VLM detection failed: {str(e)}")
+        
+        # Step 3: Ensemble all detections (traditional + VLM)
+        all_detection_lists = []
+        if traditional_detections:
+            all_detection_lists.extend(traditional_detections)
+        if vlm_detections:
+            all_detection_lists.append(vlm_detections)
+            
+        if all_detection_lists:
+            print(f"Ensembling {len(all_detection_lists)} detection sources...")
+            ensembled_detections = ensemble_detections(all_detection_lists, method=ensemble_method)
+            
+            # Optimize boxes (merge small/nearby boxes)
+            if ensembled_detections:
+                print(f"Optimizing {len(ensembled_detections)} boxes...")
+                optimized_detections = optimize_boxes_for_vlm(ensembled_detections, merge_threshold=box_merge_threshold)
+                print(f"Final ensemble result: {len(optimized_detections)} objects")
+                
+                # Convert to final format
+                for det in optimized_detections:
+                    all_objects.append({
+                        'label': det['label'],
+                        'bbox': det['bbox'],
+                        'description': f"Detected by ensemble (traditional + VLM): {det['label']}",
+                        'confidence': det['confidence'],
+                        'source': det.get('source', 'ensemble')
+                    })
+        
+        detection_time = time.time() - start_time
+        print(f"Hybrid detection completed in {detection_time:.2f} seconds")
+        print(f"Total objects detected: {len(all_objects)}")
+        
+        # Apply SAM segmentation if requested
+        if use_sam_segmentation and self.enable_sam and all_objects:
+            print("Applying SAM segmentation...")
+            seg_dir = os.path.join(self.output_dir, "segmentations")
+            os.makedirs(seg_dir, exist_ok=True)
+            
+            try:
+                segmentation_masks, segmentation_viz_path = self._apply_sam_segmentation(image, all_objects, seg_dir)
+                print(f"SAM segmentation completed with {len(segmentation_masks)} masks")
+            except Exception as e:
+                print(f"Warning: SAM segmentation failed: {str(e)}")
+        
+        # Apply privacy protection if requested
+        if apply_privacy:
+            faces, license_plates = self._detect_faces_and_plates(all_objects)
+            if faces or license_plates:
+                print(f"Applying privacy protection: {len(faces)} faces, {len(license_plates)} license plates")
+                image = self._apply_privacy_protection(image, faces, license_plates)
+        
+        # Prepare result
+        result = {
+            'image_path': image_path,
+            'objects': all_objects,
+            'detection_time': detection_time,
+            'image_dimensions': {'width': image_width, 'height': image_height},
+            'detection_method': 'hybrid',
+            'traditional_detectors_used': len(self.traditional_detectors) if self.traditional_detectors else 0,
+            'vlm_used': True,
+            'sam_segmentation': use_sam_segmentation and self.enable_sam
+        }
+        
+        if save_results:
+            # Create output directories
+            os.makedirs(self.output_dir, exist_ok=True)
+            
+            # Generate unique filename
+            timestamp = time.strftime("%Y%m%d_%H%M%S")
+            base_name = os.path.splitext(os.path.basename(image_path))[0]
+            
+            # Save JSON results
+            json_filename = f"{base_name}_hybrid_detection_{timestamp}.json"
+            json_path = os.path.join(self.output_dir, json_filename)
+            
+            # Convert to Label Studio format
+            label_studio_data = self._convert_to_label_studio_format(
+                all_objects, image_path, image_width, image_height
+            )
+            
+            with open(json_path, 'w', encoding='utf-8') as f:
+                json.dump(label_studio_data, f, indent=2, ensure_ascii=False)
+            
+            # Save visualization
+            viz_filename = f"{base_name}_hybrid_detection_{timestamp}.png"
+            viz_path = os.path.join(self.output_dir, viz_filename)
+            self._visualize_detections(image, all_objects, viz_path)
+            
+            # Save processed image (with privacy protection if applied)
+            if apply_privacy:
+                processed_filename = f"{base_name}_processed_{timestamp}.png"
+                processed_path = os.path.join(self.output_dir, processed_filename)
+                image.save(processed_path)
+                result['processed_image_path'] = processed_path
+            
+            result.update({
+                'json_path': json_path,
+                'visualization_path': viz_path
+            })
+            
+            print(f"Results saved to: {self.output_dir}")
+        
+        return result
+
     def detect_objects_batch(self, image_paths: List[str], save_results: bool = True) -> List[Dict[str, Any]]:
         """
         Perform object detection on multiple images.
@@ -1394,7 +1981,8 @@ class QwenObjectDetectionPipeline:
     def _apply_sam_segmentation(self, image: Image.Image, objects: List[Dict[str, Any]], 
                                image_path: str) -> Tuple[List[Dict[str, Any]], str]:
         """
-        Apply SAM segmentation to detected objects.
+        Apply SAM segmentation to detected objects within their bounding box regions only.
+        Updates bounding boxes based on segmentation results for better alignment.
         
         Args:
             image: PIL Image object
@@ -1410,45 +1998,51 @@ class QwenObjectDetectionPipeline:
         try:
             # Convert PIL image to numpy array for processing
             image_np = np.array(image)
-            
-            # Prepare input points from bounding boxes (center points)
-            input_points = []
-            input_labels = []
-            
-            for obj in objects:
-                bbox = obj['bbox']
-                x1, y1, x2, y2 = bbox
-                # Use center point of bounding box
-                center_x = (x1 + x2) // 2
-                center_y = (y1 + y2) // 2
-                input_points.append([center_x, center_y])
-                input_labels.append(1)  # 1 indicates foreground point
-            
-            # Process with SAM
-            inputs = self.sam_processor(image, input_points=[input_points], return_tensors="pt")
-            inputs = {k: v.to(self.device) for k, v in inputs.items()}
-            
-            with torch.no_grad():
-                outputs = self.sam_model(**inputs)
-            
-            # Get masks
-            masks = self.sam_processor.image_processor.post_process_masks(
-                outputs.pred_masks.cpu(), inputs["original_sizes"].cpu(), inputs["reshaped_input_sizes"].cpu()
-            )
-            
-            # Process masks and create visualization
+            updated_objects = []
             segmentation_masks = []
             mask_overlays = []
             
-            # Get the first (and typically only) batch of masks
-            batch_masks = masks[0] if masks else []
-            
+            # Process each object individually to constrain segmentation to bounding box
             for i, obj in enumerate(objects):
-                if i < len(batch_masks):
-                    # Get the mask for this object
-                    mask = batch_masks[i]
+                # Skip invalid objects (empty lists, None, non-dict objects, or those without 'bbox')
+                if not obj or not isinstance(obj, dict) or 'bbox' not in obj:
+                    continue
                     
-                    # Convert mask to numpy - handle different possible shapes
+                bbox = obj['bbox']
+                x1, y1, x2, y2 = int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3])
+                
+                # Extract the bounding box region from the image
+                bbox_region = image.crop((x1, y1, x2, y2))
+                
+                # Use center point of the cropped region as prompt
+                bbox_width = x2 - x1
+                bbox_height = y2 - y1
+                center_x_local = bbox_width // 2
+                center_y_local = bbox_height // 2
+                
+                # Process the cropped region with SAM
+                inputs = self.sam_processor(
+                    bbox_region, 
+                    input_points=[[[center_x_local, center_y_local]]], 
+                    return_tensors="pt"
+                )
+                inputs = {k: v.to(self.device) for k, v in inputs.items()}
+                
+                with torch.no_grad():
+                    outputs = self.sam_model(**inputs)
+                
+                # Get masks for this specific region
+                masks = self.sam_processor.image_processor.post_process_masks(
+                    outputs.pred_masks.cpu(), 
+                    inputs["original_sizes"].cpu(), 
+                    inputs["reshaped_input_sizes"].cpu()
+                )
+                
+                if masks and len(masks[0]) > 0:
+                    # Get the first mask (best segmentation)
+                    mask = masks[0][0]
+                    
+                    # Convert mask to numpy
                     if isinstance(mask, torch.Tensor):
                         mask_np = mask.squeeze().cpu().numpy()
                     else:
@@ -1458,24 +2052,55 @@ class QwenObjectDetectionPipeline:
                     if mask_np.ndim > 2:
                         mask_np = mask_np[0] if mask_np.shape[0] == 1 else mask_np.max(axis=0)
                     
-                    # Convert to uint8
-                    mask_np = (mask_np > 0.5).astype(np.uint8) * 255
+                    # Convert to binary mask
+                    binary_mask = (mask_np > 0.5).astype(np.uint8)
                     
-                    # Store mask info
-                    mask_info = {
-                        'object_id': i,
-                        'object_label': obj['label'],
-                        'mask_shape': mask_np.shape,
-                        'bbox': obj['bbox']
-                    }
-                    segmentation_masks.append(mask_info)
-                    
-                    # Create colored overlay for visualization
-                    color = plt.cm.tab10(i % 10)[:3]  # Get color from colormap
-                    colored_mask = np.zeros((*mask_np.shape, 3), dtype=np.uint8)
-                    mask_indices = mask_np > 0
-                    colored_mask[mask_indices] = [int(c * 255) for c in color]
-                    mask_overlays.append(colored_mask)
+                    # Find the tight bounding box of the segmented region
+                    mask_coords = np.where(binary_mask > 0)
+                    if len(mask_coords[0]) > 0:  # If mask contains any pixels
+                        # Get local coordinates of the segmented region
+                        local_y_min, local_y_max = mask_coords[0].min(), mask_coords[0].max()
+                        local_x_min, local_x_max = mask_coords[1].min(), mask_coords[1].max()
+                        
+                        # Convert back to global coordinates
+                        new_x1 = int(x1 + local_x_min)
+                        new_y1 = int(y1 + local_y_min)
+                        new_x2 = int(x1 + local_x_max + 1)  # +1 for inclusive bounds
+                        new_y2 = int(y1 + local_y_max + 1)
+                        
+                        # Update the object with refined bounding box
+                        updated_obj = obj.copy()
+                        updated_obj['bbox'] = [new_x1, new_y1, new_x2, new_y2]
+                        updated_obj['original_bbox'] = bbox  # Keep original for reference
+                        updated_objects.append(updated_obj)
+                        
+                        # Create full-size mask for visualization
+                        full_mask = np.zeros((image_np.shape[0], image_np.shape[1]), dtype=np.uint8)
+                        full_mask[y1:y2, x1:x2] = binary_mask * 255
+                        
+                        # Store mask info with updated bbox
+                        mask_info = {
+                            'object_id': i,
+                            'object_label': obj['label'],
+                            'mask_shape': full_mask.shape,
+                            'bbox': [new_x1, new_y1, new_x2, new_y2],
+                            'original_bbox': bbox,
+                            'mask_array': full_mask
+                        }
+                        segmentation_masks.append(mask_info)
+                        
+                        # Create colored overlay for visualization
+                        color = plt.cm.tab10(i % 10)[:3]  # Get color from colormap
+                        colored_mask = np.zeros((*full_mask.shape, 3), dtype=np.uint8)
+                        mask_indices = full_mask > 0
+                        colored_mask[mask_indices] = [int(c * 255) for c in color]
+                        mask_overlays.append(colored_mask)
+                    else:
+                        # If no valid mask, keep original object
+                        updated_objects.append(obj)
+                else:
+                    # If SAM failed for this object, keep original
+                    updated_objects.append(obj)
             
             # Create visualization with segmentation, bounding boxes, and labels
             base_name = os.path.splitext(os.path.basename(image_path))[0]
@@ -1509,14 +2134,24 @@ class QwenObjectDetectionPipeline:
             # Define colors for bounding boxes (matching segmentation colors)
             bbox_colors = ['red', 'blue', 'green', 'yellow', 'purple', 'orange', 'pink', 'brown']
             
-            # Draw bounding boxes and labels on top of segmentation
-            for i, obj in enumerate(objects):
+            # Draw both original and updated bounding boxes for comparison
+            for i, obj in enumerate(updated_objects):
+                # Skip invalid objects (empty lists, None, non-dict objects, or those without 'bbox')
+                if not obj or not isinstance(obj, dict) or 'bbox' not in obj:
+                    continue
+                    
                 if i < len(segmentation_masks):
+                    # Draw original bounding box in lighter color
+                    if 'original_bbox' in obj:
+                        orig_bbox = obj['original_bbox']
+                        orig_x1, orig_y1, orig_x2, orig_y2 = orig_bbox
+                        color = bbox_colors[i % len(bbox_colors)]
+                        draw.rectangle([orig_x1, orig_y1, orig_x2, orig_y2], outline=color, width=1)
+                    
+                    # Draw updated bounding box in bold
                     bbox = obj['bbox']
                     x1, y1, x2, y2 = bbox
                     color = bbox_colors[i % len(bbox_colors)]
-                    
-                    # Draw bounding box
                     draw.rectangle([x1, y1, x2, y2], outline=color, width=3)
                     
                     # Prepare label text
@@ -1550,6 +2185,11 @@ class QwenObjectDetectionPipeline:
             
             # Save enhanced visualization
             combined_pil.save(viz_path)
+            
+            # Update the original objects list with refined bounding boxes
+            for i, updated_obj in enumerate(updated_objects):
+                if i < len(objects):
+                    objects[i] = updated_obj
             
             return segmentation_masks, viz_path
             
@@ -1614,23 +2254,121 @@ def main():
     """
     Example usage of the QwenObjectDetectionPipeline.
     """
-    # Initialize the pipeline with SAM segmentation enabled
+    # Initialize the pipeline with traditional detectors and SAM segmentation enabled
     pipeline = QwenObjectDetectionPipeline(
         model_name="Qwen/Qwen2.5-VL-7B-Instruct",
         device="cuda",
         output_dir="./qwen_detection_results",
-        enable_sam=True  # Enable SAM segmentation capabilities
+        enable_sam=True,  # Enable SAM segmentation capabilities
+        enable_traditional_detectors=True,  # Enable traditional object detectors
+        traditional_detectors=['yolo', 'detr']  # Use YOLO and DETR detectors
     )
     
-    # Example: Process a single image with SAM segmentation
-    # image_path = "../sampledata/sjsupeople.jpg"
-    # results = pipeline.detect_objects(image_path, use_sam_segmentation=True)
-    # print(f"Detected {len(results['objects'])} objects with segmentation masks")
+    # Example: Process a single image with hybrid detection
+    image_path = "/home/lkk/Developer/VisionLangAnnotate/VisionLangAnnotateModels/sampledata/064224_000100original.jpg"
     
-    # Example: Process a video
+    # Traditional Qwen2.5-VL only detection
+    results_vlm = pipeline.detect_objects(image_path, use_sam_segmentation=True)
+    print(f"VLM-only detection: {len(results_vlm['objects'])} objects")
+    
+    # Hybrid detection (traditional + VLM)
+    results_hybrid = pipeline.detect_objects_hybrid(image_path, use_sam_segmentation=True, save_results=True)
+    print(f"Hybrid detection: {len(results_hybrid['objects'])} objects")
+    print(f"Traditional detectors used: {results_hybrid['traditional_detectors_used']}")
+    
+    # Display detected objects for hybrid detection
+    if results_hybrid['objects']:
+        print("\nHybrid Detection Results:")
+        for i, obj in enumerate(results_hybrid['objects']):
+            # Handle the actual object structure returned by the pipeline
+            if isinstance(obj, dict):
+                # Extract information from the actual object structure
+                bbox = obj.get('bbox', [])
+                label = obj.get('object_label', obj.get('label', 'Unknown'))
+                object_id = obj.get('object_id', i+1)
+                source = obj.get('source', 'SAM/Traditional')
+                
+                print(f"  Object {i+1}: {label} (ID: {object_id}, source: {source})")
+                if bbox and len(bbox) >= 4:
+                    # Handle both list and nested dict bbox formats
+                    if isinstance(bbox, list) and len(bbox) >= 4:
+                        print(f"    Bounding box: [{bbox[0]:.1f}, {bbox[1]:.1f}, {bbox[2]:.1f}, {bbox[3]:.1f}]")
+                    
+                # Show mask information if available
+                if 'mask_shape' in obj:
+                    print(f"    Mask shape: {obj['mask_shape']}")
+            else:
+                print(f"  Object {i+1}: Unknown format - {type(obj)}")
+    else:
+        print("\nNo objects detected in hybrid mode.")
+    
+    # Example: Process a video with both VLM-only and hybrid detection
     video_path = "output/dashcam_videos/Parking compliance Vantrue dashcam/20250602_065600_00002_T_A.MP4"
-    video_results = pipeline.process_video_frames(video_path, extraction_method="scene_change", use_sam_segmentation=True)
-    print(f"Extracted {video_results['summary']['frames_extracted']} frames from video")
+    
+    # Check if video file exists, otherwise use sample image for demonstration
+    if not os.path.exists(video_path):
+        print(f"Video file not found: {video_path}")
+        print("Using sample image for video processing demonstration...")
+        video_path = image_path  # Use the same sample image
+    
+    # Reuse existing pipeline and modify settings for different detection modes
+    # Save original settings
+    original_output_dir = pipeline.output_dir
+    original_enable_traditional = pipeline.enable_traditional_detectors
+    original_traditional_detectors = pipeline.traditional_detectors
+    
+    print("\n=== Video Processing with VLM-only Detection ===")
+    # Configure pipeline for VLM-only detection
+    pipeline.output_dir = "./qwen_video_results_vlm_only"
+    pipeline.enable_traditional_detectors = False
+    os.makedirs(pipeline.output_dir, exist_ok=True)
+    
+    if video_path.endswith(('.mp4', '.MP4', '.avi', '.AVI', '.mov', '.MOV')):
+        video_results_vlm = pipeline.process_video_frames(
+            video_path, 
+            extraction_method="scene_change", 
+            use_sam_segmentation=True,
+            save_results=True
+        )
+        print(f"VLM-only video processing: {video_results_vlm['summary']['frames_extracted']} frames extracted")
+        print(f"Total objects detected: {video_results_vlm['summary']['total_objects']}")
+    else:
+        # Process as single image for demonstration
+        video_results_vlm = pipeline.detect_objects(video_path, use_sam_segmentation=True, save_results=True)
+        print(f"VLM-only detection (single image): {len(video_results_vlm['objects'])} objects")
+    
+    print("\n=== Video Processing with Hybrid Detection ===")
+    # Configure pipeline for hybrid detection
+    pipeline.output_dir = "./qwen_video_results_hybrid"
+    pipeline.enable_traditional_detectors = True
+    pipeline.traditional_detectors = ['yolo', 'detr']
+    os.makedirs(pipeline.output_dir, exist_ok=True)
+    
+    if video_path.endswith(('.mp4', '.MP4', '.avi', '.AVI', '.mov', '.MOV')):
+        video_results_hybrid = pipeline.process_video_frames(
+            video_path, 
+            extraction_method="scene_change", 
+            use_sam_segmentation=True,
+            save_results=True
+        )
+        print(f"Hybrid video processing: {video_results_hybrid['summary']['frames_extracted']} frames extracted")
+        print(f"Total objects detected: {video_results_hybrid['summary']['total_objects']}")
+        print(f"Traditional detectors used: {video_results_hybrid['summary'].get('traditional_detectors_used', 0)}")
+    else:
+        # Process as single image for demonstration
+        video_results_hybrid = pipeline.detect_objects_hybrid(video_path, use_sam_segmentation=True, save_results=True)
+        print(f"Hybrid detection (single image): {len(video_results_hybrid['objects'])} objects")
+        print(f"Traditional detectors used: {video_results_hybrid['traditional_detectors_used']}")
+    
+    print("\n=== Video Processing Results Comparison ===")
+    print(f"VLM-only results saved to: ./qwen_video_results_vlm_only")
+    print(f"Hybrid results saved to: ./qwen_video_results_hybrid")
+    print("Results are saved in separate directories for easy comparison.")
+    
+    # Restore original pipeline settings
+    pipeline.output_dir = original_output_dir
+    pipeline.enable_traditional_detectors = original_enable_traditional
+    pipeline.traditional_detectors = original_traditional_detectors
     
     # Example: Process multiple images
     # image_paths = ["image1.jpg", "image2.jpg", "image3.jpg"]
@@ -1639,11 +2377,14 @@ def main():
     print("QwenObjectDetectionPipeline initialized successfully!")
     print(f"Output directory: {pipeline.output_dir}")
     print(f"SAM segmentation enabled: {pipeline.enable_sam}")
+    print(f"Traditional detectors enabled: {pipeline.enable_traditional_detectors}")
+    print(f"Available traditional detectors: {len(pipeline.traditional_detectors)}")
     print("\nTo use the pipeline:")
-    print("1. Single image: pipeline.detect_objects('path/to/image.jpg')")
-    print("2. With SAM segmentation: pipeline.detect_objects('path/to/image.jpg', use_sam_segmentation=True)")
-    print("3. Video processing: pipeline.process_video_frames('path/to/video.mp4')")
-    print("4. Multiple images: pipeline.detect_objects_batch(['img1.jpg', 'img2.jpg'])")
+    print("1. VLM-only detection: pipeline.detect_objects('path/to/image.jpg')")
+    print("2. Hybrid detection: pipeline.detect_objects_hybrid('path/to/image.jpg')")
+    print("3. With SAM segmentation: pipeline.detect_objects_hybrid('path/to/image.jpg', use_sam_segmentation=True)")
+    print("4. Video processing: pipeline.process_video_frames('path/to/video.mp4')")
+    print("5. Multiple images: pipeline.detect_objects_batch(['img1.jpg', 'img2.jpg'])")
 
 
 if __name__ == "__main__":

@@ -196,3 +196,4 @@ my_*
 *.json
 qwen_detection_results
 ocr_results
+*.pt
