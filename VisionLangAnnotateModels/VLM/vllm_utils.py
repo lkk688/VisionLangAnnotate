@@ -13,6 +13,15 @@ try:
 except ImportError:
     VLLM_AVAILABLE = False
     print("Warning: vLLM package not available. VLLMBackend will not work.")
+    
+    # Define placeholder classes for when vLLM is not available
+    class SamplingParams:
+        def __init__(self, *args, **kwargs):
+            pass
+    
+    class LLM:
+        def __init__(self, *args, **kwargs):
+            pass
 
 from VisionLangAnnotateModels.VLM.vlm_classifierv3 import VLMBackend
 

@@ -17,6 +17,25 @@ from torchvision.utils import draw_bounding_boxes
 from torchvision.transforms.functional import to_pil_image, pil_to_tensor
 
 # Traditional object detection imports
+# Import unified detector (temporarily disabled due to package import issues)
+UNIFIED_DETECTOR_AVAILABLE = False
+print("Warning: Unified detector temporarily disabled due to VisionLangAnnotateModels package import issues.")
+
+# Import unified detector from VisionLangAnnotateModels.detectors.inference
+try:
+    from VisionLangAnnotateModels.detectors.inference import ModelInference
+    UNIFIED_DETECTOR_AVAILABLE = True
+except ImportError as e:
+    UNIFIED_DETECTOR_AVAILABLE = False
+    print(f"Warning: Unified detector not available. Import error: {e}")
+    
+    # Define placeholder ModelInference class for fallback
+    class ModelInference:
+        def __init__(self, *args, **kwargs):
+            pass
+        def predict(self, *args, **kwargs):
+            return []
+
 try:
     from ultralytics import YOLO
     YOLO_AVAILABLE = True
@@ -59,96 +78,7 @@ except ImportError:
         sys.path.append(os.path.dirname(os.path.abspath(__file__)))
         from vlm_classifierv4 import HuggingFaceVLM
 
-# Traditional Object Detector Classes
-class YOLOv8Detector:
-    """YOLOv8 object detector using Ultralytics."""
-    
-    def __init__(self, model_path="yolov8x.pt"):
-        if not YOLO_AVAILABLE:
-            raise ImportError("Ultralytics YOLO not available. Install with: pip install ultralytics")
-        self.model = YOLO(model_path)
-    
-    def detect(self, image):
-        """Detect objects in image and return detections."""
-        results = self.model(image)
-        detections = []
-        for r in results:
-            if r.boxes is not None:
-                for i, box in enumerate(r.boxes.xyxy.cpu().numpy()):
-                    cls = int(r.boxes.cls[i].item())
-                    label = self.model.names[cls]
-                    conf = r.boxes.conf[i].item()
-                    detections.append({
-                        "bbox": box.tolist(), 
-                        "label": label, 
-                        "confidence": conf
-                    })
-        return detections
-
-class DETRDetector:
-    """DETR object detector using Transformers."""
-    
-    def __init__(self, model_name="facebook/detr-resnet-50", threshold=0.3):
-        if not DETR_AVAILABLE:
-            raise ImportError("DETR models not available. Install transformers for DETR support.")
-        self.processor = DetrImageProcessor.from_pretrained(model_name)
-        self.model = DetrForObjectDetection.from_pretrained(model_name)
-        self.model.eval()
-        self.threshold = threshold
-    
-    def detect(self, image):
-        """Detect objects in image and return detections."""
-        inputs = self.processor(images=image, return_tensors="pt")
-        with torch.no_grad():
-            outputs = self.model(**inputs)
-        
-        target_sizes = torch.tensor([image.size[::-1]])  # (height, width)
-        results = self.processor.post_process_object_detection(
-            outputs, target_sizes=target_sizes, threshold=self.threshold
-        )[0]
-        
-        detections = []
-        for score, label, box in zip(results["scores"], results["labels"], results["boxes"]):
-            box = box.tolist()  # [x0, y0, x1, y1]
-            label_str = self.model.config.id2label[label.item()].lower()
-            detections.append({
-                "bbox": box,
-                "label": label_str,
-                "confidence": score.item()
-            })
-        return detections
-
-class RTDETRDetector:
-    """RT-DETR object detector using Transformers."""
-    
-    def __init__(self, model_name="SenseTime/deformable-detr", threshold=0.3):
-        if not DETR_AVAILABLE:
-            raise ImportError("DETR models not available. Install transformers for DETR support.")
-        self.processor = AutoProcessor.from_pretrained(model_name)
-        self.model = AutoModelForObjectDetection.from_pretrained(model_name)
-        self.model.eval()
-        self.threshold = threshold
-    
-    def detect(self, image):
-        """Detect objects in image and return detections."""
-        inputs = self.processor(images=image, return_tensors="pt")
-        with torch.no_grad():
-            outputs = self.model(**inputs)
-        
-        target_sizes = torch.tensor([image.size[::-1]])  # (height, width)
-        results = self.processor.post_process_object_detection(
-            outputs, target_sizes=target_sizes, threshold=self.threshold
-        )[0]
-        
-        detections = []
-        for score, label, box in zip(results["scores"], results["labels"], results["boxes"]):
-            label_str = self.model.config.id2label[label.item()].lower()
-            detections.append({
-                "bbox": box.tolist(),
-                "label": label_str,
-                "confidence": score.item()
-            })
-        return detections
+# Traditional detector classes removed - now using unified ModelInference from detectors.inference
 
 # Ensemble and Box Optimization Functions
 def ensemble_detections(detection_lists, iou_thr=0.5, method='nms'):
@@ -702,32 +632,58 @@ class QwenObjectDetectionPipeline:
         self._setup_output_directories()
     
     def _initialize_traditional_detectors(self, detector_names: List[str]):
-        """Initialize traditional object detectors."""
+        """Initialize traditional object detectors using unified ModelInference."""
         for detector_name in detector_names:
             try:
                 if detector_name.lower() == 'yolo':
-                    if YOLO_AVAILABLE:
-                        detector = YOLOv8Detector(model_path="yolov8x.pt")
+                    if UNIFIED_DETECTOR_AVAILABLE:
+                        detector = ModelInference(model_type="yolo", model_name="yolov8x")
                         self.traditional_detectors.append(detector)
-                        print(f"Initialized YOLOv8 detector")
+                        print(f"Initialized YOLOv8 detector (unified)")
+                    elif YOLO_AVAILABLE:
+                        # Fallback to direct YOLO usage if unified detector not available
+                        from ultralytics import YOLO
+                        detector = YOLO("yolov8x.pt")
+                        self.traditional_detectors.append(detector)
+                        print(f"Initialized YOLOv8 detector (fallback)")
                     else:
-                        print(f"Warning: YOLO not available, skipping")
+                        print(f"Warning: Neither unified detector nor YOLO available, skipping YOLO")
                 
                 elif detector_name.lower() == 'detr':
-                    if DETR_AVAILABLE:
-                        detector = DETRDetector(model_name="facebook/detr-resnet-50")
+                    if UNIFIED_DETECTOR_AVAILABLE:
+                        detector = ModelInference(model_type="detr", model_name="facebook/detr-resnet-50")
                         self.traditional_detectors.append(detector)
-                        print(f"Initialized DETR detector")
+                        print(f"Initialized DETR detector (unified)")
+                    elif DETR_AVAILABLE:
+                        # Fallback to direct DETR usage if unified detector not available
+                        from transformers import DetrImageProcessor, DetrForObjectDetection
+                        detector = {
+                            'processor': DetrImageProcessor.from_pretrained("facebook/detr-resnet-50"),
+                            'model': DetrForObjectDetection.from_pretrained("facebook/detr-resnet-50"),
+                            'type': 'detr'
+                        }
+                        self.traditional_detectors.append(detector)
+                        print(f"Initialized DETR detector (fallback)")
                     else:
-                        print(f"Warning: DETR not available, skipping")
+                        print(f"Warning: Neither unified detector nor DETR available, skipping DETR")
                 
                 elif detector_name.lower() == 'rtdetr':
-                    if DETR_AVAILABLE:
-                        detector = RTDETRDetector(model_name="SenseTime/deformable-detr")
+                    if UNIFIED_DETECTOR_AVAILABLE:
+                        detector = ModelInference(model_type="rtdetr", model_name="SenseTime/deformable-detr")
                         self.traditional_detectors.append(detector)
-                        print(f"Initialized RT-DETR detector")
+                        print(f"Initialized RT-DETR detector (unified)")
+                    elif DETR_AVAILABLE:
+                        # Fallback to direct RT-DETR usage if unified detector not available
+                        from transformers import AutoProcessor, AutoModelForObjectDetection
+                        detector = {
+                            'processor': AutoProcessor.from_pretrained("SenseTime/deformable-detr"),
+                            'model': AutoModelForObjectDetection.from_pretrained("SenseTime/deformable-detr"),
+                            'type': 'rtdetr'
+                        }
+                        self.traditional_detectors.append(detector)
+                        print(f"Initialized RT-DETR detector (fallback)")
                     else:
-                        print(f"Warning: RT-DETR not available, skipping")
+                        print(f"Warning: Neither unified detector nor DETR available, skipping RT-DETR")
                 
                 else:
                     print(f"Warning: Unknown detector '{detector_name}', skipping")
@@ -1004,6 +960,169 @@ class QwenObjectDetectionPipeline:
         
         # Default to 'Other' if no match found
         return 'Other'
+    
+    def _generate_cropped_classification_prompt(self, allowed_classes: List[str]) -> str:
+        """
+        Generate VLM prompt for classifying cropped image regions.
+        
+        Args:
+            allowed_classes: List of allowed class names
+            
+        Returns:
+            Formatted prompt string for cropped image classification
+        """
+        classes_str = ", ".join(allowed_classes)
+        
+        prompt = f"""Analyze this cropped image region and classify the main object.
+
+You must respond in this exact format:
+RESULT_START
+Object: [class_name] [confidence] [description]
+RESULT_END
+
+Where:
+- class_name: Must be one of these allowed classes: {classes_str}
+- confidence: Number between 0.0 and 1.0
+- description: Brief description of what you see
+
+Important rules:
+1. Only classify the MAIN object in this cropped region
+2. Use ONLY the allowed classes listed above
+3. If no clear object matches the allowed classes, use "Other"
+4. Provide a confidence score based on how certain you are
+5. Keep description brief and factual
+
+Example response:
+RESULT_START
+Object: Car 0.95 Red sedan parked on street
+RESULT_END"""
+        
+        return prompt
+    
+    def _parse_cropped_classification_response(self, response: str) -> Dict[str, Any]:
+        """
+        Parse VLM response for cropped image classification.
+        
+        Args:
+            response: Raw VLM response
+            
+        Returns:
+            Dictionary with classification results or None if parsing failed
+        """
+        try:
+            # Extract content between RESULT_START and RESULT_END markers
+            start_marker = "RESULT_START"
+            end_marker = "RESULT_END"
+            
+            start_idx = response.find(start_marker)
+            end_idx = response.find(end_marker)
+            
+            if start_idx == -1 or end_idx == -1:
+                print(f"Warning: Could not find result markers in cropped classification response")
+                return None
+            
+            # Extract content between markers
+            content = response[start_idx + len(start_marker):end_idx].strip()
+            
+            # Parse object line: "Object: [class_name] [confidence] [description]"
+            for line in content.split('\n'):
+                line = line.strip()
+                if line.startswith('Object:'):
+                    # Remove "Object:" prefix and parse
+                    object_info = line[7:].strip()  # Remove "Object: "
+                    parts = object_info.split(' ', 2)  # Split into max 3 parts
+                    
+                    if len(parts) >= 2:
+                        label = parts[0]
+                        try:
+                            confidence = float(parts[1])
+                        except (ValueError, IndexError):
+                            confidence = 0.8
+                        
+                        description = parts[2] if len(parts) > 2 else f"Detected by VLM: {label}"
+                        
+                        # Map to allowed classes
+                        mapped_label = self._map_vlm_to_allowed_classes(label)
+                        
+                        return {
+                            'label': mapped_label,
+                            'confidence': confidence,
+                            'description': description,
+                            'source': 'vlm_cropped'
+                        }
+            
+            print(f"Warning: Could not parse object information from cropped classification response")
+            return None
+            
+        except Exception as e:
+            print(f"Error parsing cropped classification response: {e}")
+            return None
+    
+    def _analyze_cropped_regions(self, image: Image.Image, traditional_detections: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        Analyze cropped regions from traditional detectors using VLM for classification.
+        
+        Args:
+            image: PIL Image object
+            traditional_detections: List of traditional detector results
+            
+        Returns:
+            List of detections with VLM-updated classifications
+        """
+        detections = []
+        
+        # Generate classification prompt
+        prompt = self._generate_cropped_classification_prompt(self.allowed_classes)
+        
+        for i, detection in enumerate(traditional_detections):
+            try:
+                # Extract bounding box coordinates
+                bbox = detection['bbox']
+                x1, y1, x2, y2 = bbox
+                
+                # Crop the image region
+                cropped_image = image.crop((x1, y1, x2, y2))
+                
+                # Analyze cropped region with VLM
+                print(f"Analyzing cropped region {i+1}/{len(traditional_detections)}: {detection['label']} at ({x1},{y1},{x2},{y2})")
+                
+                # Get VLM classification for this cropped region
+                vlm_response = self.vlm.generate_response(
+                    image=cropped_image,
+                    prompt=prompt
+                )
+                
+                # Parse VLM response
+                classification_result = self._parse_cropped_classification_response(vlm_response)
+                
+                if classification_result:
+                    # Create detection with original bbox but VLM classification
+                    detection_result = {
+                        'label': classification_result['label'],
+                        'bbox': bbox,  # Keep original traditional detector bbox
+                        'confidence': classification_result['confidence'],
+                        'description': classification_result['description'],
+                        'source': 'vlm_cropped',
+                        'original_traditional_label': detection['label'],
+                        'original_traditional_confidence': detection.get('confidence', 0.0)
+                    }
+                    detections.append(detection_result)
+                    print(f"  -> VLM classified as: {classification_result['label']} (confidence: {classification_result['confidence']:.2f})")
+                else:
+                    # Fallback to original detection if VLM parsing failed
+                    fallback_detection = detection.copy()
+                    fallback_detection['source'] = 'traditional_fallback'
+                    detections.append(fallback_detection)
+                    print(f"  -> VLM classification failed, using original: {detection['label']}")
+                    
+            except Exception as e:
+                print(f"Error analyzing cropped region {i}: {e}")
+                # Fallback to original detection
+                fallback_detection = detection.copy()
+                fallback_detection['source'] = 'traditional_fallback'
+                detections.append(fallback_detection)
+        
+        return detections
     
     def _parse_detection_response(self, response: str, image_width: int, image_height: int) -> List[Dict[str, Any]]:
         """
@@ -1673,111 +1792,635 @@ class QwenObjectDetectionPipeline:
         plt.savefig(output_path, dpi=300, bbox_inches='tight')
         plt.close()
     
-    def detect_objects(self, image_path: str, save_results: bool = True, apply_privacy: bool = True, use_sam_segmentation: bool = False) -> Dict[str, Any]:
+    def detect_objects(self, image_path: Union[str, List[str]], save_results: bool = True, apply_privacy: bool = True, use_sam_segmentation: bool = False, save_folder: Optional[str] = None, batch_size: int = 4) -> Union[Dict[str, Any], List[Dict[str, Any]]]:
         """
-        Perform object detection on a single image.
+        Perform object detection on a single image or batch of images using efficient batch inference.
         
         Args:
-            image_path: Path to the input image
+            image_path: Path to the input image or list of image paths
             save_results: Whether to save results to files
             apply_privacy: Whether to apply privacy protection (blur faces/plates)
             use_sam_segmentation: Whether to apply SAM segmentation post-processing
+            save_folder: Optional folder to save results (overrides default output_dir)
+            batch_size: Batch size for processing multiple images
             
         Returns:
-            Dictionary containing detection results and file paths
+            Dictionary for single image or list of dictionaries for batch processing
         """
-        print(f"Processing image: {image_path}")
+        # Handle single image processing
+        if isinstance(image_path, str):
+            image_paths = [image_path]
+            is_single = True
+        else:
+            image_paths = image_path
+            is_single = False
         
-        # Load image
-        try:
-            image = Image.open(image_path).convert('RGB')
-            image_width, image_height = image.size
-        except Exception as e:
-            raise ValueError(f"Error loading image {image_path}: {str(e)}")
+        print(f"Processing {len(image_paths)} image(s) with batch size {batch_size}")
         
-        # Generate detection prompt and get response
-        print("Running object detection...")
-        start_time = time.time()
+        all_results = []
         
-        try:
-            responses = self.vlm.generate([image], [self.detection_prompt])
-            raw_response = responses[0] if responses else ""
-        except Exception as e:
-            raise RuntimeError(f"Error during model inference: {str(e)}")
+        # Process images in batches for efficient GPU utilization
+        for batch_start in range(0, len(image_paths), batch_size):
+            batch_paths = image_paths[batch_start:batch_start + batch_size]
+            batch_num = batch_start // batch_size + 1
+            total_batches = (len(image_paths) + batch_size - 1) // batch_size
+            
+            print(f"\nProcessing batch {batch_num}/{total_batches} ({len(batch_paths)} images)")
+            
+            # Load all images in the batch
+            batch_images = []
+            batch_metadata = []
+            
+            for img_path in batch_paths:
+                try:
+                    image = Image.open(img_path).convert('RGB')
+                    image_width, image_height = image.size
+                    batch_images.append(image)
+                    batch_metadata.append({
+                        'path': img_path,
+                        'width': image_width,
+                        'height': image_height
+                    })
+                except Exception as e:
+                    print(f"Error loading image {img_path}: {str(e)}")
+                    # Add placeholder for failed image
+                    batch_images.append(None)
+                    batch_metadata.append({
+                        'path': img_path,
+                        'width': 0,
+                        'height': 0,
+                        'error': str(e)
+                    })
+            
+            # Batch inference for better GPU utilization
+            valid_images = [img for img in batch_images if img is not None]
+            valid_indices = [i for i, img in enumerate(batch_images) if img is not None]
+            
+            if valid_images:
+                print(f"Running batch inference on {len(valid_images)} valid images...")
+                start_time = time.time()
+                
+                try:
+                    prompts = [self.detection_prompt] * len(valid_images)
+                    responses = self.vlm.generate(valid_images, prompts)
+                    batch_inference_time = time.time() - start_time
+                    print(f"Batch inference completed in {batch_inference_time:.2f} seconds")
+                except Exception as e:
+                    print(f"Error during batch inference: {str(e)}")
+                    responses = [""] * len(valid_images)
+                    batch_inference_time = 0
+            else:
+                responses = []
+                batch_inference_time = 0
+            
+            # Process each image result
+            response_idx = 0
+            for i, (image, metadata) in enumerate(zip(batch_images, batch_metadata)):
+                if 'error' in metadata:
+                    # Handle failed image loading
+                    result = {
+                        'image_path': metadata['path'],
+                        'image_width': 0,
+                        'image_height': 0,
+                        'objects': [],
+                        'raw_response': '',
+                        'detection_time': 0,
+                        'model_name': self.model_name,
+                        'privacy_protected_path': None,
+                        'segmentation_masks': [],
+                        'segmentation_visualization_path': None,
+                        'error': metadata['error']
+                    }
+                    all_results.append(result)
+                    continue
+                
+                # Parse detection response
+                raw_response = responses[response_idx] if response_idx < len(responses) else ""
+                response_idx += 1
+                
+                print(f"Parsing results for {metadata['path']}...")
+                objects = self._parse_detection_response(raw_response, metadata['width'], metadata['height'])
+                print(f"Found {len(objects)} objects")
+                
+                # Apply SAM segmentation if requested
+                segmentation_masks = []
+                segmentation_visualization_path = None
+                if use_sam_segmentation and self.enable_sam and objects:
+                    try:
+                        print(f"Applying SAM segmentation to {metadata['path']}...")
+                        segmentation_masks, segmentation_visualization_path = self._apply_sam_segmentation(
+                            image, objects, metadata['path'], "vlm"
+                        )
+                    except Exception as e:
+                        print(f"Warning: SAM segmentation failed for {metadata['path']}: {str(e)}")
+                
+                # Apply privacy protection if requested
+                privacy_protected_path = None
+                if apply_privacy and objects:
+                    try:
+                        privacy_protected_path = self.apply_privacy_protection(metadata['path'], objects)
+                    except Exception as e:
+                        print(f"Warning: Privacy protection failed for {metadata['path']}: {str(e)}")
+                
+                # Prepare results
+                result = {
+                    'image_path': metadata['path'],
+                    'image_width': metadata['width'],
+                    'image_height': metadata['height'],
+                    'objects': objects,
+                    'raw_response': raw_response,
+                    'detection_time': batch_inference_time / len(valid_images) if valid_images else 0,
+                    'model_name': self.model_name,
+                    'privacy_protected_path': privacy_protected_path,
+                    'segmentation_masks': segmentation_masks,
+                    'segmentation_visualization_path': segmentation_visualization_path
+                }
+                
+                all_results.append(result)
+            
+            # Clear GPU cache after batch processing
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
         
-        detection_time = time.time() - start_time
-        print(f"Detection completed in {detection_time:.2f} seconds")
-        
-        # Parse the response to extract objects
-        print("Parsing detection results...")
-        objects = self._parse_detection_response(raw_response, image_width, image_height)
-        print(f"Found {len(objects)} objects")
-        
-        # Apply SAM segmentation if requested and available
-        segmentation_masks = []
-        segmentation_visualization_path = None
-        if use_sam_segmentation and self.enable_sam and objects:
-            try:
-                print("Applying SAM segmentation...")
-                segmentation_start_time = time.time()
-                segmentation_masks, segmentation_visualization_path = self._apply_sam_segmentation(
-                    image, objects, image_path, "vlm"
-                )
-                segmentation_time = time.time() - segmentation_start_time
-                print(f"SAM segmentation completed in {segmentation_time:.2f} seconds")
-            except Exception as e:
-                print(f"Warning: SAM segmentation failed: {str(e)}")
-        
-        # Apply privacy protection if requested
-        privacy_protected_path = None
-        if apply_privacy and objects:
-            try:
-                privacy_protected_path = self.apply_privacy_protection(image_path, objects)
-                print(f"Privacy protection applied, saved to: {privacy_protected_path}")
-            except Exception as e:
-                print(f"Warning: Privacy protection failed: {str(e)}")
-        
-        # Prepare results
-        results = {
-            'image_path': image_path,
-            'image_width': image_width,
-            'image_height': image_height,
-            'objects': objects,
-            'raw_response': raw_response,
-            'detection_time': detection_time,
-            'model_name': self.model_name,
-            'privacy_protected_path': privacy_protected_path,
-            'segmentation_masks': segmentation_masks,
-            'segmentation_visualization_path': segmentation_visualization_path
-        }
-        
+        # Save results if requested
         if save_results:
-            # Generate output file names
-            base_name = os.path.splitext(os.path.basename(image_path))[0]
-            timestamp = time.strftime("%Y%m%d_%H%M%S")
+            if len(all_results) == 1:
+                self._save_detection_results(all_results[0], save_folder)
+            else:
+                self._save_batch_detection_results(all_results, save_folder)
+        
+        # Return single result or list based on input
+        return all_results[0] if is_single else all_results
+    
+
+
+    def detect_objects_hybrid(self, image_path: Union[str, List[str]], save_results: bool = True, apply_privacy: bool = True, 
+                            use_sam_segmentation: bool = False, ensemble_method: str = 'nms', 
+                            box_merge_threshold: float = 0.3, sequential_mode: bool = False, 
+                            cropped_sequential_mode: bool = False, save_folder: Optional[str] = None, 
+                            batch_size: int = 4) -> Union[Dict[str, Any], List[Dict[str, Any]]]:
+        """
+        Perform hybrid object detection combining traditional detectors with Qwen2.5-VL using efficient batch inference.
+        
+        This method supports three modes:
+        
+        Standard mode (sequential_mode=False, cropped_sequential_mode=False):
+        1. Runs traditional detectors and VLM in parallel
+        2. Ensembles all results together
+        
+        Sequential mode (sequential_mode=True, cropped_sequential_mode=False):
+        1. First runs traditional object detectors to get bounding boxes
+        2. Uses VLM to analyze only the detected bounding boxes on full image
+        3. Replaces traditional detector results with VLM analysis of those boxes
+        
+        Cropped Sequential mode (cropped_sequential_mode=True):
+        1. First runs traditional object detectors to get bounding boxes
+        2. Crops image regions based on detected bounding boxes
+        3. Sends cropped images to VLM for classification and description
+        4. Uses traditional detector bounding boxes with VLM-provided labels and descriptions
+        
+        Args:
+            image_path: Path to the input image or list of image paths for batch processing
+            save_results: Whether to save results to files
+            apply_privacy: Whether to apply privacy protection (blur faces/plates)
+            use_sam_segmentation: Whether to apply SAM segmentation post-processing
+            ensemble_method: Method for ensembling traditional detectors ('nms' or 'wbf')
+            box_merge_threshold: Threshold for merging nearby/overlapping boxes
+            sequential_mode: If True, use sequential detection (traditional first, then VLM on boxes)
+            cropped_sequential_mode: If True, use cropped sequential mode (crop regions and classify)
+            save_folder: Optional folder to save results (overrides default output directory)
+            batch_size: Batch size for processing multiple images
             
-            # Save raw response
-            raw_file = os.path.join(self.raw_dir, f"{base_name}_{timestamp}_raw.txt")
-            with open(raw_file, 'w', encoding='utf-8') as f:
-                f.write(f"Image: {image_path}\n")
-                f.write(f"Model: {self.model_name}\n")
-                f.write(f"Detection Time: {detection_time:.2f}s\n")
-                f.write(f"Objects Found: {len(objects)}\n")
-                f.write("\n" + "="*50 + "\n")
-                f.write(raw_response)
+        Returns:
+            Dictionary containing detection results and file paths (single image) or 
+            List of dictionaries for batch processing
+        """
+        # Handle single image processing
+        if isinstance(image_path, str):
+            image_paths = [image_path]
+            is_single = True
+        else:
+            image_paths = image_path
+            is_single = False
+        
+        print(f"Processing {len(image_paths)} image(s) with hybrid detection using batch size {batch_size}")
+        
+        all_results = []
+        
+        # Process images in batches for efficient GPU utilization
+        for batch_start in range(0, len(image_paths), batch_size):
+            batch_paths = image_paths[batch_start:batch_start + batch_size]
+            batch_num = batch_start // batch_size + 1
+            total_batches = (len(image_paths) + batch_size - 1) // batch_size
             
-            # Convert to Label Studio format and save
-            label_studio_data = self._convert_to_label_studio_format(
-                objects, image_path, image_width, image_height
-            )
+            print(f"\nProcessing batch {batch_num}/{total_batches} ({len(batch_paths)} images)")
             
-            json_file = os.path.join(self.json_dir, f"{base_name}_{timestamp}_annotations.json")
-            with open(json_file, 'w', encoding='utf-8') as f:
-                json.dump(label_studio_data, f, indent=2, ensure_ascii=False)
+            # Load all images in the batch
+            batch_images = []
+            batch_metadata = []
             
-            # Create visualization
-            viz_file = os.path.join(self.viz_dir, f"{base_name}_{timestamp}_detection.png")
-            self._visualize_detections(image, objects, viz_file)
+            for img_path in batch_paths:
+                try:
+                    image = Image.open(img_path).convert('RGB')
+                    image_width, image_height = image.size
+                    batch_images.append(image)
+                    batch_metadata.append({
+                        'path': img_path,
+                        'width': image_width,
+                        'height': image_height
+                    })
+                except Exception as e:
+                    print(f"Error loading image {img_path}: {str(e)}")
+                    # Add placeholder for failed image
+                    batch_images.append(None)
+                    batch_metadata.append({
+                        'path': img_path,
+                        'width': 0,
+                        'height': 0,
+                        'error': str(e)
+                    })
+            
+            # Step 1: Run traditional detectors on all valid images in batch
+            batch_traditional_detections = []
+            valid_images = [img for img in batch_images if img is not None]
+            valid_indices = [i for i, img in enumerate(batch_images) if img is not None]
+            
+            if self.enable_traditional_detectors and self.traditional_detectors and valid_images:
+                print(f"Running traditional detectors on {len(valid_images)} valid images...")
+                
+                for detector in self.traditional_detectors:
+                    detector_batch_results = []
+                    try:
+                        for img in valid_images:
+                            # Handle unified ModelInference detector
+                            if hasattr(detector, 'predict') and hasattr(detector, 'model_type'):
+                                result = detector.predict(img, visualize=False)
+                                detections = result.get('detections', []) if isinstance(result, dict) else []
+                                # Convert ModelInference format to expected format
+                                formatted_detections = []
+                                for det in detections: #det has 'score'
+                                    if 'bbox' in det and ('confidence' in det or 'score' in det):
+                                        label = det.get('class_name', det.get('label', 'unknown'))
+                                        confidence = det.get('confidence', det.get('score', 0.0))
+                                        formatted_detections.append({
+                                            'bbox': det['bbox'],
+                                            'confidence': confidence,
+                                            'label': label
+                                        })
+                                detections = formatted_detections
+                            # Handle fallback YOLO detector
+                            elif hasattr(detector, 'predict') and not hasattr(detector, 'model_type'):
+                                results = detector.predict(img)
+                                detections = []
+                                for result in results:
+                                    for box in result.boxes:
+                                        x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
+                                        conf = box.conf[0].cpu().numpy()
+                                        cls = int(box.cls[0].cpu().numpy())
+                                        label = detector.names[cls]
+                                        detections.append({
+                                            'bbox': [int(x1), int(y1), int(x2), int(y2)],
+                                            'confidence': float(conf),
+                                            'label': label
+                                        })
+                            # Handle fallback DETR/RT-DETR detector (dict format)
+                            elif isinstance(detector, dict) and 'type' in detector:
+                                if detector['type'] == 'detr':
+                                    inputs = detector['processor'](images=img, return_tensors="pt")
+                                    outputs = detector['model'](**inputs)
+                                    target_sizes = torch.tensor([img.size[::-1]])
+                                    results = detector['processor'].post_process_object_detection(outputs, target_sizes=target_sizes, threshold=0.5)[0]
+                                    detections = []
+                                    for score, label, box in zip(results["scores"], results["labels"], results["boxes"]):
+                                        x1, y1, x2, y2 = box.cpu().numpy()
+                                        detections.append({
+                                            'bbox': [int(x1), int(y1), int(x2), int(y2)],
+                                            'confidence': float(score),
+                                            'label': detector['model'].config.id2label[int(label)]
+                                        })
+                                elif detector['type'] == 'rtdetr':
+                                    inputs = detector['processor'](images=img, return_tensors="pt")
+                                    outputs = detector['model'](**inputs)
+                                    target_sizes = torch.tensor([img.size[::-1]])
+                                    results = detector['processor'].post_process_object_detection(outputs, target_sizes=target_sizes, threshold=0.5)[0]
+                                    detections = []
+                                    for score, label, box in zip(results["scores"], results["labels"], results["boxes"]):
+                                        x1, y1, x2, y2 = box.cpu().numpy()
+                                        detections.append({
+                                            'bbox': [int(x1), int(y1), int(x2), int(y2)],
+                                            'confidence': float(score),
+                                            'label': detector['model'].config.id2label[int(label)]
+                                        })
+                            else:
+                                # Fallback to original detect method if available
+                                detections = detector.detect(img)
+                            
+                            # Map COCO classes to allowed classes
+                            mapped_detections = []
+                            for det in detections:
+                                if isinstance(det, dict) and 'label' in det:
+                                    mapped_label = map_coco_to_allowed_classes(det['label'])
+                                    mapped_det = det.copy()
+                                    mapped_det['label'] = mapped_label
+                                    mapped_det['original_coco_label'] = det['label']
+                                    mapped_detections.append(mapped_det)
+                            detector_batch_results.append(mapped_detections)
+                        
+                        batch_traditional_detections.append(detector_batch_results)
+                        # Get detector name safely
+                        if hasattr(detector, '__class__'):
+                            detector_name = detector.__class__.__name__
+                        elif isinstance(detector, dict) and 'type' in detector:
+                            detector_name = f"{detector['type'].upper()} (fallback)"
+                        else:
+                            detector_name = str(type(detector).__name__)
+                        print(f"  {detector_name}: processed {len(valid_images)} images")
+                    except Exception as e:
+                        # Get detector name safely for error reporting
+                        if hasattr(detector, '__class__'):
+                            detector_name = detector.__class__.__name__
+                        elif isinstance(detector, dict) and 'type' in detector:
+                            detector_name = f"{detector['type'].upper()} (fallback)"
+                        else:
+                            detector_name = str(type(detector).__name__)
+                        print(f"  Warning: {detector_name} failed: {str(e)}")
+                        continue
+            
+            # Step 2: Batch VLM inference
+            batch_vlm_responses = []
+            if valid_images:
+                if cropped_sequential_mode and batch_traditional_detections:
+                    print("Running cropped sequential VLM analysis...")
+                    # Handle cropped sequential mode for batch
+                    for img_idx, img in enumerate(valid_images):
+                        # Get traditional detections for this image
+                        img_traditional_boxes = []
+                        for detector_results in batch_traditional_detections:
+                            if img_idx < len(detector_results):
+                                img_traditional_boxes.extend(detector_results[img_idx])
+                        
+                        if img_traditional_boxes:
+                            try:
+                                vlm_objects = self._analyze_cropped_regions(img, img_traditional_boxes)
+                                batch_vlm_responses.append(vlm_objects)
+                            except Exception as e:
+                                print(f"Warning: Cropped sequential VLM failed for image {img_idx}: {str(e)}")
+                                batch_vlm_responses.append([])
+                        else:
+                            batch_vlm_responses.append([])
+                elif sequential_mode and batch_traditional_detections:
+                    print("Running sequential VLM analysis...")
+                    # Handle sequential mode for batch
+                    batch_prompts = []
+                    for img_idx, img in enumerate(valid_images):
+                        # Get traditional detections for this image
+                        img_traditional_boxes = []
+                        for detector_results in batch_traditional_detections:
+                            if img_idx < len(detector_results):
+                                img_traditional_boxes.extend(detector_results[img_idx])
+                        
+                        if img_traditional_boxes:
+                            bbox_tuples = [tuple(det['bbox']) for det in img_traditional_boxes]
+                            bbox_prompt = self._generate_bbox_specific_prompt(bbox_tuples)
+                            batch_prompts.append(bbox_prompt)
+                        else:
+                            batch_prompts.append(self.detection_prompt)
+                    
+                    try:
+                        responses = self.vlm.generate(valid_images, batch_prompts)
+                        batch_vlm_responses = responses
+                    except Exception as e:
+                        print(f"Warning: Sequential VLM batch inference failed: {str(e)}")
+                        batch_vlm_responses = [""] * len(valid_images)
+                else:
+                    # Standard mode: comprehensive VLM analysis
+                    print(f"Running batch VLM inference on {len(valid_images)} images...")
+                    start_time = time.time()
+                    
+                    try:
+                        prompts = [self.detection_prompt] * len(valid_images)
+                        responses = self.vlm.generate(valid_images, prompts)
+                        batch_inference_time = time.time() - start_time
+                        print(f"Batch VLM inference completed in {batch_inference_time:.2f} seconds")
+                        batch_vlm_responses = responses
+                    except Exception as e:
+                        print(f"Error during batch VLM inference: {str(e)}")
+                        batch_vlm_responses = [""] * len(valid_images)
+            
+            # Process each image result
+            vlm_response_idx = 0
+            for i, (image, metadata) in enumerate(zip(batch_images, batch_metadata)):
+                if 'error' in metadata:
+                    # Handle failed image loading
+                    result = {
+                        'image_path': metadata['path'],
+                        'objects': [],
+                        'detection_time': 0,
+                        'image_dimensions': {'width': 0, 'height': 0},
+                        'detection_method': 'hybrid',
+                        'traditional_detectors_used': 0,
+                        'vlm_used': True,
+                        'sam_segmentation': False,
+                        'error': metadata['error']
+                    }
+                    all_results.append(result)
+                    continue
+                
+                start_time = time.time()
+                
+                # Get traditional detections for this image
+                traditional_detections = []
+                if batch_traditional_detections and vlm_response_idx < len(valid_indices):
+                    for detector_results in batch_traditional_detections:
+                        if vlm_response_idx < len(detector_results):
+                            traditional_detections.append(detector_results[vlm_response_idx])
+                
+                # Process VLM response for this image
+                vlm_detections = []
+                if vlm_response_idx < len(batch_vlm_responses):
+                    vlm_response = batch_vlm_responses[vlm_response_idx]
+                    
+                    if cropped_sequential_mode and isinstance(vlm_response, list):
+                        # VLM response is already processed objects from cropped analysis
+                        for obj in vlm_response:
+                            vlm_detections.append({
+                                'label': obj['label'],
+                                'bbox': obj['bbox'],
+                                'confidence': obj.get('confidence', 0.8),
+                                'description': obj.get('description', f"VLM cropped analysis: {obj['label']}"),
+                                'source': 'vlm_cropped_sequential'
+                            })
+                    elif sequential_mode and traditional_detections:
+                        # Parse bbox-specific VLM response
+                        all_traditional_boxes = []
+                        for detector_detections in traditional_detections:
+                            all_traditional_boxes.extend(detector_detections)
+                        
+                        if all_traditional_boxes:
+                            try:
+                                vlm_objects = self._parse_bbox_specific_response(vlm_response, all_traditional_boxes)
+                                for obj in vlm_objects:
+                                    vlm_detections.append({
+                                        'label': obj['label'],
+                                        'bbox': obj['bbox'],
+                                        'confidence': obj.get('confidence', 0.8),
+                                        'description': obj.get('description', f"VLM analysis: {obj['label']}"),
+                                        'source': 'vlm_sequential'
+                                    })
+                            except Exception as e:
+                                print(f"Warning: Failed to parse sequential VLM response: {str(e)}")
+                    else:
+                        # Standard mode: parse comprehensive VLM response
+                        try:
+                            vlm_objects = self._parse_detection_response(vlm_response, metadata['width'], metadata['height'])
+                            for obj in vlm_objects:
+                                vlm_detections.append({
+                                    'label': obj['label'],
+                                    'bbox': obj['bbox'],
+                                    'confidence': obj.get('confidence', 0.8),
+                                    'description': obj.get('description', f"Detected by VLM: {obj['label']}"),
+                                    'source': 'vlm'
+                                })
+                        except Exception as e:
+                            print(f"Warning: Failed to parse VLM response: {str(e)}")
+                
+                vlm_response_idx += 1
+                
+                # Step 3: Ensemble detections
+                if sequential_mode and vlm_detections:
+                    all_objects = vlm_detections.copy()
+                    # Add unanalyzed traditional detections
+                    analyzed_boxes = {tuple(obj['bbox']) for obj in vlm_detections}
+                    for detector_detections in traditional_detections:
+                        for det in detector_detections:
+                            if tuple(det['bbox']) not in analyzed_boxes:
+                                all_objects.append({
+                                    'label': det['label'],
+                                    'bbox': det['bbox'],
+                                    'confidence': det['confidence'],
+                                    'description': f"Traditional detector: {det['label']}",
+                                    'source': det.get('source', 'traditional')
+                                })
+                else:
+                    # Standard ensemble
+                    all_objects = ensemble_hybrid_vlm_detections(
+                        traditional_detections=traditional_detections,
+                        vlm_detections=vlm_detections,
+                        ensemble_method=ensemble_method,
+                        box_merge_threshold=box_merge_threshold,
+                        matching_method='overlap',
+                        iou_threshold=0.3,
+                        overlap_threshold=0.5
+                    )
+                
+                detection_time = time.time() - start_time
+                print(f"Processed {metadata['path']}: {len(all_objects)} objects detected")
+                
+                # Apply SAM segmentation if requested
+                segmentation_masks = []
+                segmentation_visualization_path = None
+                if use_sam_segmentation and self.enable_sam and all_objects:
+                    try:
+                        segmentation_masks, segmentation_visualization_path = self._apply_sam_segmentation(
+                            image, all_objects, metadata['path'], "hybrid"
+                        )
+                    except Exception as e:
+                        print(f"Warning: SAM segmentation failed for {metadata['path']}: {str(e)}")
+                
+                # Apply privacy protection if requested
+                privacy_protected_path = None
+                if apply_privacy and all_objects:
+                    try:
+                        faces, license_plates = self._detect_faces_and_plates(all_objects)
+                        if faces or license_plates:
+                            privacy_objects = faces + license_plates
+                            privacy_protected_path = self.apply_privacy_protection(metadata['path'], privacy_objects)
+                    except Exception as e:
+                        print(f"Warning: Privacy protection failed for {metadata['path']}: {str(e)}")
+                
+                # Prepare result
+                result = {
+                    'image_path': metadata['path'],
+                    'objects': all_objects,
+                    'detection_time': detection_time,
+                    'image_dimensions': {'width': metadata['width'], 'height': metadata['height']},
+                    'detection_method': 'hybrid',
+                    'traditional_detectors_used': len(self.traditional_detectors) if self.traditional_detectors else 0,
+                    'vlm_used': True,
+                    'sam_segmentation': use_sam_segmentation and self.enable_sam,
+                    'privacy_protected_path': privacy_protected_path,
+                    'segmentation_masks': segmentation_masks,
+                    'segmentation_visualization_path': segmentation_visualization_path,
+                    'model_name': self.model_name,
+                    'raw_response': batch_vlm_responses[vlm_response_idx] if vlm_response_idx < len(batch_vlm_responses) else 'No VLM response generated',
+                    'image_width': metadata['width'],
+                    'image_height': metadata['height']
+                }
+                
+                all_results.append(result)
+            
+            # Clear GPU cache after batch processing
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        
+        # Save results if requested
+        if save_results:
+            if len(all_results) == 1:
+                self._save_detection_results(all_results[0], save_folder)
+            else:
+                self._save_batch_detection_results(all_results, save_folder)
+        
+        # Return single result or list based on input
+        return all_results[0] if is_single else all_results
+    
+
+    
+    def _save_detection_results(self, results: Dict[str, Any], save_folder: Optional[str] = None):
+        """
+        Save detection results to files.
+        """
+        # Determine output directories
+        if save_folder:
+            raw_dir = os.path.join(save_folder, "raw_responses")
+            json_dir = os.path.join(save_folder, "json_annotations")
+            viz_dir = os.path.join(save_folder, "visualizations")
+            
+            # Create directories if they don't exist
+            for dir_path in [raw_dir, json_dir, viz_dir]:
+                os.makedirs(dir_path, exist_ok=True)
+        else:
+            raw_dir = self.raw_dir
+            json_dir = self.json_dir
+            viz_dir = self.viz_dir
+        
+        # Generate output file names
+        base_name = os.path.splitext(os.path.basename(results['image_path']))[0]
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        
+        # Save raw response
+        raw_file = os.path.join(raw_dir, f"{base_name}_{timestamp}_raw.txt")
+        with open(raw_file, 'w', encoding='utf-8') as f:
+            f.write(f"Image: {results['image_path']}\n")
+            f.write(f"Model: {results['model_name']}\n")
+            f.write(f"Detection Time: {results['detection_time']:.2f}s\n")
+            f.write(f"Objects Found: {len(results['objects'])}\n")
+            f.write("\n" + "="*50 + "\n")
+            f.write(results['raw_response'])
+        
+        # Convert to Label Studio format and save
+        label_studio_data = self._convert_to_label_studio_format(
+            results['objects'], results['image_path'], results['image_width'], results['image_height']
+        )
+        
+        json_file = os.path.join(json_dir, f"{base_name}_{timestamp}_annotations.json")
+        with open(json_file, 'w', encoding='utf-8') as f:
+            json.dump(label_studio_data, f, indent=2, ensure_ascii=False)
+        
+        # Create visualization
+        try:
+            image = Image.open(results['image_path']).convert('RGB')
+            viz_file = os.path.join(viz_dir, f"{base_name}_{timestamp}_detection.png")
+            self._visualize_detections(image, results['objects'], viz_file)
             
             # Add file paths to results
             results.update({
@@ -1790,310 +2433,42 @@ class QwenObjectDetectionPipeline:
             print(f"  - Raw response: {raw_file}")
             print(f"  - JSON annotations: {json_file}")
             print(f"  - Visualization: {viz_file}")
-            if segmentation_visualization_path:
-                print(f"  - SAM Segmentation: {segmentation_visualization_path}")
-        
-        return results
-
-    def detect_objects_hybrid(self, image_path: str, save_results: bool = True, apply_privacy: bool = True, 
-                            use_sam_segmentation: bool = False, ensemble_method: str = 'nms', 
-                            box_merge_threshold: float = 0.3, sequential_mode: bool = False) -> Dict[str, Any]:
-        """
-        Perform hybrid object detection combining traditional detectors with Qwen2.5-VL.
-        
-        This method supports two modes:
-        
-        Standard mode (sequential_mode=False):
-        1. Runs traditional detectors and VLM in parallel
-        2. Ensembles all results together
-        
-        Sequential mode (sequential_mode=True):
-        1. First runs traditional object detectors to get bounding boxes
-        2. Uses VLM to analyze only the detected bounding boxes
-        3. Replaces traditional detector results with VLM analysis of those boxes
-        
-        Args:
-            image_path: Path to the input image
-            save_results: Whether to save results to files
-            apply_privacy: Whether to apply privacy protection (blur faces/plates)
-            use_sam_segmentation: Whether to apply SAM segmentation post-processing
-            ensemble_method: Method for ensembling traditional detectors ('nms' or 'wbf')
-            box_merge_threshold: Threshold for merging nearby/overlapping boxes
-            sequential_mode: If True, use sequential detection (traditional first, then VLM on boxes)
-            
-        Returns:
-            Dictionary containing detection results and file paths
-        """
-        print(f"Processing image with hybrid detection: {image_path}")
-        
-        # Load image
-        try:
-            image = Image.open(image_path).convert('RGB')
-            image_width, image_height = image.size
+            if results.get('segmentation_visualization_path'):
+                print(f"  - SAM Segmentation: {results['segmentation_visualization_path']}")
         except Exception as e:
-            raise ValueError(f"Error loading image {image_path}: {str(e)}")
+            print(f"Warning: Could not create visualization: {str(e)}")
+    
+    def _save_batch_detection_results(self, results: List[Dict[str, Any]], save_folder: Optional[str] = None):
+        """
+        Save batch detection results.
+        """
+        # Save individual results
+        for result in results:
+            if 'error' not in result:
+                self._save_detection_results(result, save_folder)
         
-        start_time = time.time()
-        all_objects = []
-        traditional_detections = []
+        # Save batch summary
+        output_dir = save_folder if save_folder else self.output_dir
+        summary_file = os.path.join(output_dir, f"batch_detection_summary_{time.strftime('%Y%m%d_%H%M%S')}.json")
         
-        # Step 1: Run traditional detectors if enabled
-        if self.enable_traditional_detectors and self.traditional_detectors:
-            print("Running traditional object detectors...")
-            
-            for detector in self.traditional_detectors:
-                try:
-                    detections = detector.detect(image)
-                    # Map COCO classes to allowed classes for traditional detectors
-                    mapped_detections = []
-                    for det in detections:
-                        mapped_label = map_coco_to_allowed_classes(det['label'])
-                        mapped_det = det.copy()
-                        mapped_det['label'] = mapped_label
-                        mapped_det['original_coco_label'] = det['label']  # Keep original for reference
-                        mapped_detections.append(mapped_det)
-                    
-                    traditional_detections.append(mapped_detections)
-                    print(f"  {detector.__class__.__name__}: {len(detections)} detections")
-                except Exception as e:
-                    print(f"  Warning: {detector.__class__.__name__} failed: {str(e)}")
-                    continue
-            
-        # Step 2: Run Qwen2.5-VL analysis
-        vlm_detections = []
-        
-        if sequential_mode and traditional_detections:
-            # Sequential mode: analyze specific bounding boxes from traditional detectors
-            print("Running sequential VLM analysis on traditional detector bounding boxes...")
-            
-            # Flatten all traditional detections
-            all_traditional_boxes = []
-            for detector_detections in traditional_detections:
-                all_traditional_boxes.extend(detector_detections)
-            
-            if all_traditional_boxes:
-                # Extract bounding box tuples for prompt generation
-                bbox_tuples = [tuple(det['bbox']) for det in all_traditional_boxes]
-                # Generate bbox-specific prompt
-                bbox_prompt = self._generate_bbox_specific_prompt(bbox_tuples)
-                
-                try:
-                    responses = self.vlm.generate([image], [bbox_prompt])
-                    raw_response = responses[0] if responses else ""
-                    
-                    # Parse bbox-specific VLM response
-                    vlm_objects = self._parse_bbox_specific_response(raw_response, all_traditional_boxes)
-                    
-                    # Convert VLM objects to detection format for ensemble
-                    for obj in vlm_objects:
-                        vlm_detections.append({
-                            'label': obj['label'],
-                            'bbox': obj['bbox'],
-                            'confidence': obj.get('confidence', 0.8),
-                            'description': obj.get('description', f"VLM analysis: {obj['label']}"),
-                            'source': 'vlm_sequential'
-                        })
-                        
-                except Exception as e:
-                    print(f"Warning: Sequential VLM detection failed: {str(e)}")
-            else:
-                print("No traditional detections found for sequential analysis")
-        else:
-            # Standard mode: comprehensive VLM analysis
-            print("Running Qwen2.5-VL for comprehensive analysis...")
-            try:
-                responses = self.vlm.generate([image], [self.detection_prompt])
-                raw_response = responses[0] if responses else ""
-                
-                # Parse VLM response
-                vlm_objects = self._parse_detection_response(raw_response, image_width, image_height)
-                
-                # Convert VLM objects to detection format for ensemble
-                for obj in vlm_objects:
-                    vlm_detections.append({
-                        'label': obj['label'],
-                        'bbox': obj['bbox'],
-                        'confidence': obj.get('confidence', 0.8),  # Default confidence for VLM
-                        'description': obj.get('description', f"Detected by VLM: {obj['label']}"),
-                        'source': 'vlm'
-                    })
-                    
-            except Exception as e:
-                print(f"Warning: VLM detection failed: {str(e)}")
-        
-        # Step 3: Ensemble all detections
-        if sequential_mode and vlm_detections:
-            # In sequential mode, VLM results take priority as they refine traditional detector boxes
-            print("Using sequential ensemble: VLM results take priority")
-            all_objects = vlm_detections.copy()
-            
-            # Add any traditional detections that weren't analyzed by VLM
-            analyzed_boxes = {tuple(obj['bbox']) for obj in vlm_detections}
-            for detector_detections in traditional_detections:
-                for det in detector_detections:
-                    if tuple(det['bbox']) not in analyzed_boxes:
-                        all_objects.append({
-                            'label': det['label'],
-                            'bbox': det['bbox'],
-                            'confidence': det['confidence'],
-                            'description': f"Traditional detector: {det['label']}",
-                            'source': det.get('source', 'traditional')
-                        })
-        else:
-            # Standard ensemble using hybrid ensemble function
-            all_objects = ensemble_hybrid_vlm_detections(
-                traditional_detections=traditional_detections,
-                vlm_detections=vlm_detections,
-                ensemble_method=ensemble_method,
-                box_merge_threshold=box_merge_threshold,
-                matching_method='overlap',  # Use overlap method for better matching
-                iou_threshold=0.3,
-                overlap_threshold=0.5
-            )
-        
-        detection_time = time.time() - start_time
-        print(f"Hybrid detection completed in {detection_time:.2f} seconds")
-        print(f"Total objects detected: {len(all_objects)}")
-        
-        # Apply SAM segmentation if requested
-        # Initialize segmentation visualization path
-        segmentation_visualization_path = None
-        
-        if use_sam_segmentation and self.enable_sam and all_objects:
-            print("Applying SAM segmentation...")
-            seg_dir = os.path.join(self.output_dir, "segmentations")
-            os.makedirs(seg_dir, exist_ok=True)
-            
-            try:
-                segmentation_masks, segmentation_visualization_path = self._apply_sam_segmentation(image, all_objects, image_path, "hybrid")
-                print(f"SAM segmentation completed with {len(segmentation_masks)} masks")
-            except Exception as e:
-                print(f"Warning: SAM segmentation failed: {str(e)}")
-        
-        # Apply privacy protection if requested
-        if apply_privacy:
-            faces, license_plates = self._detect_faces_and_plates(all_objects)
-            if faces or license_plates:
-                print(f"Applying privacy protection: {len(faces)} faces, {len(license_plates)} license plates")
-                privacy_objects = faces + license_plates
-                privacy_protected_path = self.apply_privacy_protection(image_path, privacy_objects)
-        
-        # Prepare result
-        result = {
-            'image_path': image_path,
-            'objects': all_objects,
-            'detection_time': detection_time,
-            'image_dimensions': {'width': image_width, 'height': image_height},
-            'detection_method': 'hybrid',
-            'traditional_detectors_used': len(self.traditional_detectors) if self.traditional_detectors else 0,
-            'vlm_used': True,
-            'sam_segmentation': use_sam_segmentation and self.enable_sam
+        summary = {
+            'total_images': len(results),
+            'successful_detections': len([r for r in results if 'error' not in r]),
+            'failed_detections': len([r for r in results if 'error' in r]),
+            'total_objects_detected': sum(len(r.get('objects', [])) for r in results),
+            'model_name': self.model_name,
+            'processing_time': time.strftime("%Y-%m-%d %H:%M:%S"),
+            'results': results
         }
         
-        if save_results:
-            # Generate output file names
-            base_name = os.path.splitext(os.path.basename(image_path))[0]
-            timestamp = time.strftime("%Y%m%d_%H%M%S")
-            
-            # Save raw response (create a synthetic raw response for hybrid method)
-            raw_response = f"Hybrid Detection Results\nTraditional Detectors: {len(self.traditional_detectors) if self.traditional_detectors else 0}\nVLM Used: True\nTotal Objects: {len(all_objects)}\nDetection Time: {detection_time:.2f}s\n\nDetected Objects:\n"
-            for i, obj in enumerate(all_objects):
-                raw_response += f"{i+1}. {obj['label']} - {obj['description']}\n"
-            
-            raw_file = os.path.join(self.raw_dir, f"{base_name}_{timestamp}_hybrid_raw.txt")
-            with open(raw_file, 'w', encoding='utf-8') as f:
-                f.write(f"Image: {image_path}\n")
-                f.write(f"Model: {self.model_name}\n")
-                f.write(f"Detection Time: {detection_time:.2f}s\n")
-                f.write(f"Objects Found: {len(all_objects)}\n")
-                f.write(f"Detection Method: hybrid\n")
-                f.write("\n" + "="*50 + "\n")
-                f.write(raw_response)
-            
-            # Convert to Label Studio format and save
-            label_studio_data = self._convert_to_label_studio_format(
-                all_objects, image_path, image_width, image_height
-            )
-            
-            json_file = os.path.join(self.json_dir, f"{base_name}_{timestamp}_hybrid_annotations.json")
-            with open(json_file, 'w', encoding='utf-8') as f:
-                json.dump(label_studio_data, f, indent=2, ensure_ascii=False)
-            
-            # Create visualization
-            viz_file = os.path.join(self.viz_dir, f"{base_name}_{timestamp}_hybrid_detection.png")
-            self._visualize_detections(image, all_objects, viz_file)
-            
-            # Save processed image (with privacy protection if applied)
-            if apply_privacy:
-                processed_filename = f"{base_name}_{timestamp}_hybrid_processed.png"
-                processed_path = os.path.join(self.output_dir, processed_filename)
-                image.save(processed_path)
-                result['processed_image_path'] = processed_path
-            
-            # Add file paths to results
-            result.update({
-                'raw_response_file': raw_file,
-                'json_annotation_file': json_file,
-                'visualization_file': viz_file
-            })
-            
-            print(f"Results saved:")
-            print(f"  - Raw response: {raw_file}")
-            print(f"  - JSON annotations: {json_file}")
-            print(f"  - Visualization: {viz_file}")
-            if segmentation_visualization_path:
-                print(f"  - SAM Segmentation: {segmentation_visualization_path}")
+        with open(summary_file, 'w', encoding='utf-8') as f:
+            json.dump(summary, f, indent=2, ensure_ascii=False)
+        
+        print(f"\nBatch summary saved: {summary_file}")
         
         return result
 
-    def detect_objects_batch(self, image_paths: List[str], save_results: bool = True) -> List[Dict[str, Any]]:
-        """
-        Perform object detection on multiple images.
-        
-        Args:
-            image_paths: List of paths to input images
-            save_results: Whether to save results to files
-            
-        Returns:
-            List of detection results for each image
-        """
-        results = []
-        
-        print(f"Processing {len(image_paths)} images...")
-        
-        for i, image_path in enumerate(image_paths, 1):
-            print(f"\n[{i}/{len(image_paths)}] Processing: {os.path.basename(image_path)}")
-            
-            try:
-                result = self.detect_objects(image_path, save_results)
-                results.append(result)
-            except Exception as e:
-                print(f"Error processing {image_path}: {str(e)}")
-                results.append({
-                    'image_path': image_path,
-                    'error': str(e),
-                    'objects': []
-                })
-        
-        if save_results:
-            # Save batch summary
-            summary_file = os.path.join(self.output_dir, f"batch_summary_{time.strftime('%Y%m%d_%H%M%S')}.json")
-            summary = {
-                'total_images': len(image_paths),
-                'successful_detections': len([r for r in results if 'error' not in r]),
-                'failed_detections': len([r for r in results if 'error' in r]),
-                'total_objects_detected': sum(len(r.get('objects', [])) for r in results),
-                'model_name': self.model_name,
-                'processing_time': time.strftime("%Y-%m-%d %H:%M:%S"),
-                'results': results
-            }
-            
-            with open(summary_file, 'w', encoding='utf-8') as f:
-                json.dump(summary, f, indent=2, ensure_ascii=False)
-            
-            print(f"\nBatch summary saved: {summary_file}")
-        
-        return results
+    # detect_objects_batch is now redundant - use detect_objects with list input instead
 
 
     def extract_video_metadata(self, video_path: str) -> Tuple[Dict[str, Any], Dict[str, Any], str]:
@@ -2216,7 +2591,7 @@ class QwenObjectDetectionPipeline:
     def process_video_frames(self, video_path: str, target_size: Tuple[int, int] = (640, 480), 
                            extraction_method: str = "scene_change", scenechange_threshold: float = 10.0,
                            save_results: bool = True, use_sam_segmentation: bool = False, 
-                           batch_size: int = 4) -> Dict[str, Any]:
+                           batch_size: int = 4, save_folder: Optional[str] = None) -> Dict[str, Any]:
         """
         Extract key frames from a video file and perform object detection on each frame.
         
@@ -2228,6 +2603,7 @@ class QwenObjectDetectionPipeline:
             save_results: Whether to save results to files
             use_sam_segmentation: Whether to apply SAM segmentation to detected objects
             batch_size: Number of frames to process in batch for better GPU utilization
+            save_folder: Optional folder to save results (uses output_dir if not specified)
             
         Returns:
             Dictionary containing video processing results
@@ -2265,7 +2641,8 @@ class QwenObjectDetectionPipeline:
         
         # Create video-specific output directory
         video_name = os.path.splitext(os.path.basename(video_path))[0]
-        video_output_dir = os.path.join(self.output_dir, f"video_{video_name}_{self._get_timestamp()}")
+        base_output_dir = save_folder if save_folder else self.output_dir
+        video_output_dir = os.path.join(base_output_dir, f"video_{video_name}_{self._get_timestamp()}")
         
         if save_results:
             os.makedirs(video_output_dir, exist_ok=True)
@@ -2359,10 +2736,41 @@ class QwenObjectDetectionPipeline:
                 # Process batch when it reaches the specified size
                 if len(self._frame_batch) >= batch_size:
                     try:
-                        batch_results = self._process_frame_batch(
-                            self._frame_batch, video_output_dir, video_name, 
-                            use_sam_segmentation, save_results=save_results
-                        )
+                        # Process each frame in the batch
+                        batch_results = []
+                        for frame_data in self._frame_batch:
+                            # Create temporary file path for the frame if not saved
+                            if frame_data['frame_filename'] and save_results:
+                                frame_path = os.path.join(video_output_dir, "frames", frame_data['frame_filename'])
+                            else:
+                                # Save frame temporarily for processing
+                                import tempfile
+                                temp_fd, frame_path = tempfile.mkstemp(suffix='.jpg')
+                                os.close(temp_fd)
+                                frame_data['image'].save(frame_path, "JPEG", quality=95)
+                            
+                            # Use appropriate detection method based on configuration
+                            if self.enable_traditional_detectors:
+                                result = self.detect_objects_hybrid(
+                                    frame_path, save_results=False, 
+                                    use_sam_segmentation=use_sam_segmentation,
+                                    save_folder=save_folder
+                                )
+                            else:
+                                result = self.detect_objects(
+                                    frame_path, save_results=False,
+                                    use_sam_segmentation=use_sam_segmentation, 
+                                    save_folder=save_folder
+                                )
+                            
+                            batch_results.append(result)
+                            
+                            # Clean up temporary file if created
+                            if not (frame_data['frame_filename'] and save_results):
+                                try:
+                                    os.unlink(frame_path)
+                                except:
+                                    pass
                         
                         # Add results and frame info
                         for i, (frame_data, frame_results) in enumerate(zip(self._frame_batch, batch_results)):
@@ -2423,10 +2831,41 @@ class QwenObjectDetectionPipeline:
         if hasattr(self, '_frame_batch') and self._frame_batch:
             try:
                 print(f"Processing final batch of {len(self._frame_batch)} frames...")
-                batch_results = self._process_frame_batch(
-                    self._frame_batch, video_output_dir, video_name, 
-                    use_sam_segmentation, save_results=save_results
-                )
+                # Process each frame in the batch
+                batch_results = []
+                for frame_data in self._frame_batch:
+                    # Create temporary file path for the frame if not saved
+                    if frame_data['frame_filename'] and save_results:
+                        frame_path = os.path.join(video_output_dir, "frames", frame_data['frame_filename'])
+                    else:
+                        # Save frame temporarily for processing
+                        import tempfile
+                        temp_fd, frame_path = tempfile.mkstemp(suffix='.jpg')
+                        os.close(temp_fd)
+                        frame_data['image'].save(frame_path, "JPEG", quality=95)
+                    
+                    # Use appropriate detection method based on configuration
+                    if self.enable_traditional_detectors:
+                        result = self.detect_objects_hybrid(
+                            frame_path, save_results=False,
+                            use_sam_segmentation=use_sam_segmentation,
+                            save_folder=save_folder
+                        )
+                    else:
+                        result = self.detect_objects(
+                            frame_path, save_results=False,
+                            use_sam_segmentation=use_sam_segmentation,
+                            save_folder=save_folder
+                        )
+                    
+                    batch_results.append(result)
+                    
+                    # Clean up temporary file if created
+                    if not (frame_data['frame_filename'] and save_results):
+                        try:
+                            os.unlink(frame_path)
+                        except:
+                            pass
                 
                 # Add results and frame info
                 for i, (frame_data, frame_results) in enumerate(zip(self._frame_batch, batch_results)):
@@ -2520,146 +2959,8 @@ class QwenObjectDetectionPipeline:
         
         return video_results
     
-    def _process_frame_batch(self, frame_batch: List[Dict[str, Any]], video_output_dir: str, 
-                           video_name: str, use_sam_segmentation: bool = False, 
-                           save_results: bool = True) -> List[Dict[str, Any]]:
-        """
-        Process a batch of frames efficiently with GPU memory optimization.
-        
-        Args:
-            frame_batch: List of frame dictionaries with image data and metadata
-            video_output_dir: Output directory for saving results
-            video_name: Base name of the video
-            use_sam_segmentation: Whether to apply SAM segmentation
-            save_results: Whether to save results to files
-            
-        Returns:
-            List of processing results for each frame
-        """
-        if not frame_batch:
-            return []
-        
-        batch_results = []
-        
-        try:
-            # Extract images from batch
-            images = [frame_data['image'] for frame_data in frame_batch]
-            prompts = [self.detection_prompt] * len(images)
-            
-            # Batch inference for better GPU utilization
-            print(f"Processing batch of {len(images)} frames...")
-            start_time = time.time()
-            
-            # Process all images in batch
-            responses = self.vlm.generate(images, prompts)
-            batch_inference_time = time.time() - start_time
-            print(f"Batch inference completed in {batch_inference_time:.2f} seconds")
-            
-            # Process each frame result
-            for i, (frame_data, response) in enumerate(zip(frame_batch, responses)):
-                try:
-                    image = frame_data['image']
-                    image_width, image_height = image.size
-                    
-                    # Parse detection response
-                    objects = self._parse_detection_response(response, image_width, image_height)
-                    
-                    # Apply SAM segmentation if requested
-                    segmentation_masks = []
-                    segmentation_visualization_path = None
-                    if use_sam_segmentation and self.enable_sam and objects:
-                        try:
-                            segmentation_masks, segmentation_visualization_path = self._apply_sam_segmentation(
-                                image, objects, f"frame_{frame_data['saved_index']:04d}", "vlm"
-                            )
-                            
-                            # Save segmentation to video directory
-                            if segmentation_visualization_path and save_results:
-                                seg_filename = f"{video_name}_frame_{frame_data['saved_index']:04d}_{self._get_timestamp()}_segmentation.png"
-                                final_seg_path = os.path.join(video_output_dir, "segmentations", seg_filename)
-                                
-                                # Copy segmentation result to video directory
-                                import shutil
-                                shutil.copy2(segmentation_visualization_path, final_seg_path)
-                                segmentation_visualization_path = final_seg_path
-                                
-                        except Exception as e:
-                            print(f"Warning: SAM segmentation failed for frame {frame_data['saved_index']}: {str(e)}")
-                    
-                    # Create frame results
-                    frame_results = {
-                        'objects': objects,
-                        'raw_response': response,
-                        'inference_time': batch_inference_time / len(images),  # Approximate per-frame time
-                        'model_name': self.model_name,
-                        'segmentation_masks': segmentation_masks,
-                        'segmentation_visualization_path': segmentation_visualization_path
-                    }
-                    
-                    # Save individual frame results if requested
-                    if save_results:
-                        # Save raw response
-                        raw_filename = f"{video_name}_frame_{frame_data['saved_index']:04d}_{self._get_timestamp()}_raw.txt"
-                        raw_path = os.path.join(video_output_dir, "raw_responses", raw_filename)
-                        with open(raw_path, 'w', encoding='utf-8') as f:
-                            f.write(response)
-                        
-                        # Save JSON annotations
-                        json_filename = f"{video_name}_frame_{frame_data['saved_index']:04d}_{self._get_timestamp()}_annotations.json"
-                        json_path = os.path.join(video_output_dir, "json_annotations", json_filename)
-                        
-                        # Create Label Studio format for this frame
-                        frame_annotation = self._convert_to_label_studio_format(
-                            objects, 
-                            frame_data.get('frame_filename', f"frame_{frame_data['saved_index']:04d}.jpg"), 
-                            image_width, 
-                            image_height
-                        )
-                        
-                        with open(json_path, 'w', encoding='utf-8') as f:
-                            json.dump(frame_annotation, f, indent=2, ensure_ascii=False)
-                        
-                        # Save visualization
-                        if objects:
-                            vis_filename = f"{video_name}_frame_{frame_data['saved_index']:04d}_{self._get_timestamp()}_detection.png"
-                            vis_path = os.path.join(video_output_dir, "visualizations", vis_filename)
-                            self._visualize_detections(image, objects, vis_path)
-                    
-                    batch_results.append(frame_results)
-                    
-                    print(f"Processed frame {frame_data['saved_index']}: {frame_data['timestamp']} - {len(objects)} objects detected")
-                    
-                except Exception as e:
-                    print(f"Error processing frame {frame_data['saved_index']}: {e}")
-                    # Add empty result to maintain batch consistency
-                    batch_results.append({
-                        'objects': [],
-                        'raw_response': '',
-                        'inference_time': 0,
-                        'model_name': self.model_name,
-                        'segmentation_masks': [],
-                        'segmentation_visualization_path': None,
-                        'error': str(e)
-                    })
-            
-            # Clear GPU cache after batch processing
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-                
-        except Exception as e:
-            print(f"Error in batch processing: {e}")
-            # Return empty results for the batch
-            batch_results = [{
-                'objects': [],
-                'raw_response': '',
-                'inference_time': 0,
-                'model_name': self.model_name,
-                'segmentation_masks': [],
-                'segmentation_visualization_path': None,
-                'error': str(e)
-            } for _ in frame_batch]
-        
-        return batch_results
+    # _process_frame_batch function removed - redundant since detect_objects_hybrid now handles batch processing directly
+    # Use detect_objects_hybrid with a list of image paths for batch processing
     
     def _calculate_iou(self, bbox1, bbox2):
         """
@@ -2914,73 +3215,208 @@ class QwenObjectDetectionPipeline:
             print(f"Error in SAM segmentation: {e}")
             return [], None
     
-    def detect_objects_from_image(self, image: Image.Image, save_results: bool = True, use_sam_segmentation: bool = False) -> Dict[str, Any]:
-        """
-        Perform object detection on a PIL Image object.
-        
-        Args:
-            image: PIL Image object
-            save_results: Whether to save results to files
-            use_sam_segmentation: Whether to apply SAM segmentation to detected objects
-            
-        Returns:
-            Dictionary containing detection results
-        """
-        try:
-            # Get image dimensions
-            image_width, image_height = image.size
-            
-            # Generate detection prompt
-            prompt = self.detection_prompt
-            
-            # Perform inference
-            start_time = time.time()
-            response = self.vlm.generate([image], [prompt])[0]
-            inference_time = time.time() - start_time
-            
-            # Parse the response
-            objects = self._parse_detection_response(response, image_width, image_height)
-            
-            # Apply SAM segmentation if requested and enabled
-            if use_sam_segmentation and self.enable_sam and objects:
-                # Create segmentations directory
-                seg_dir = os.path.join(self.output_dir, "segmentations")
-                os.makedirs(seg_dir, exist_ok=True)
-                
-                # Apply SAM segmentation to detected objects
-                segmentation_masks, segmentation_viz_path = self._apply_sam_segmentation(image, objects, "image_from_pil", "vlm")
-            
-            return {
-                'objects': objects,
-                'raw_response': response,
-                'inference_time': inference_time,
-                'image_dimensions': {'width': image_width, 'height': image_height}
-            }
-            
-        except Exception as e:
-            print(f"Error during object detection: {e}")
-            return {
-                'objects': [],
-                'raw_response': '',
-                'inference_time': 0,
-                'image_dimensions': {'width': 0, 'height': 0},
-                'error': str(e)
-            }
-
-def main():
-    """
-    Example usage of the QwenObjectDetectionPipeline.
-    """
-    # Initialize the pipeline with traditional detectors and SAM segmentation enabled
-    pipeline = QwenObjectDetectionPipeline(
-        model_name="Qwen/Qwen2.5-VL-7B-Instruct",
-        device="cuda",
-        output_dir="./output/qwen_detection_results",
-        enable_sam=True,  # Enable SAM segmentation capabilities
-        enable_traditional_detectors=True,  # Enable traditional object detectors
-        traditional_detectors=['yolo', 'detr']  # Use YOLO and DETR detectors
-    )
+    # detect_objects_from_image function removed - redundant since detect_objects now handles PIL Image objects directly
+    # Use detect_objects with PIL Image objects for the same functionality
     
+    # detect_objects_unified function removed - redundant with optimized detect_objects function
+    # Use detect_objects() instead, which now handles single images, PIL Images, and batch processing directly
+    
+    # _process_single_input function removed - redundant with optimized detect_objects function
+    # Use detect_objects() instead, which now handles single images and PIL Images directly
+    
+    # _process_batch_inputs function removed - redundant with optimized detect_objects function
+    # Use detect_objects() with a list input instead, which now handles batch processing directly
+    
+    def _save_single_result(self, result: Dict[str, Any], save_folder: Optional[str] = None):
+        """
+        Save results for a single image.
+        """
+        output_dir = save_folder if save_folder else self.output_dir
+        
+        # Create subdirectories
+        raw_dir = os.path.join(output_dir, "raw_responses")
+        json_dir = os.path.join(output_dir, "json_annotations")
+        viz_dir = os.path.join(output_dir, "visualizations")
+        
+        for dir_path in [raw_dir, json_dir, viz_dir]:
+            os.makedirs(dir_path, exist_ok=True)
+        
+        # Generate file names
+        base_name = os.path.splitext(os.path.basename(result['image_path']))[0]
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        
+        # Save raw response
+        raw_file = os.path.join(raw_dir, f"{base_name}_{timestamp}_raw.txt")
+        with open(raw_file, 'w', encoding='utf-8') as f:
+            f.write(f"Image: {result['image_path']}\n")
+            f.write(f"Model: {result['model_name']}\n")
+            f.write(f"Detection Time: {result['detection_time']:.2f}s\n")
+            f.write(f"Objects Found: {len(result['objects'])}\n")
+            f.write("\n" + "="*50 + "\n")
+            f.write(result['raw_response'])
+        
+        # Convert to Label Studio format and save
+        label_studio_data = self._convert_to_label_studio_format(
+            result['objects'], result['image_path'], result['image_width'], result['image_height']
+        )
+        
+        json_file = os.path.join(json_dir, f"{base_name}_{timestamp}_annotations.json")
+        with open(json_file, 'w', encoding='utf-8') as f:
+            json.dump(label_studio_data, f, indent=2, ensure_ascii=False)
+        
+        # Create visualization
+        if result['image_path'] != "pil_image":
+            try:
+                image = Image.open(result['image_path']).convert('RGB')
+                viz_file = os.path.join(viz_dir, f"{base_name}_{timestamp}_detection.png")
+                self._visualize_detections(image, result['objects'], viz_file)
+                result['visualization_file'] = viz_file
+            except Exception as e:
+                print(f"Warning: Could not create visualization: {str(e)}")
+        
+        # Update result with file paths
+        result.update({
+            'raw_response_file': raw_file,
+            'json_annotation_file': json_file
+        })
+    
+    def _save_batch_summary(self, results: List[Dict[str, Any]], save_folder: Optional[str] = None):
+        """
+        Save batch processing summary.
+        """
+        output_dir = save_folder if save_folder else self.output_dir
+        
+        summary_file = os.path.join(output_dir, f"batch_summary_{time.strftime('%Y%m%d_%H%M%S')}.json")
+        summary = {
+            'total_images': len(results),
+            'successful_detections': len([r for r in results if 'error' not in r]),
+            'failed_detections': len([r for r in results if 'error' in r]),
+            'total_objects_detected': sum(len(r.get('objects', [])) for r in results),
+            'model_name': self.model_name,
+            'processing_time': time.strftime("%Y-%m-%d %H:%M:%S"),
+            'results': results
+        }
+        
+        with open(summary_file, 'w', encoding='utf-8') as f:
+            json.dump(summary, f, indent=2, ensure_ascii=False)
+        
+        print(f"\nBatch summary saved: {summary_file}")
+
+def video_example(pipeline, sample_image_path="./sample_image.jpg"):
+    # Example: Process a video with both VLM-only and hybrid detection
+    video_path = "output/dashcam_videos/Parking compliance Vantrue dashcam/20250602_065600_00002_T_A.MP4"
+    
+    # Check if video file exists, otherwise use sample image for demonstration
+    if not os.path.exists(video_path):
+        print(f"Video file not found: {video_path}")
+        print("Using sample image for video processing demonstration...")
+        video_path = sample_image_path  # Use the same sample image
+    
+    # Reuse existing pipeline and modify settings for different detection modes
+    # Save original settings
+    original_output_dir = pipeline.output_dir
+    original_enable_traditional = pipeline.enable_traditional_detectors
+    original_traditional_detectors = pipeline.traditional_detectors
+    
+    print("\n=== Video Processing with VLM-only Detection ===")
+    # Configure pipeline for VLM-only detection
+    pipeline.output_dir = "./output/qwen_video_results_vlm_only"
+    pipeline.enable_traditional_detectors = False
+    os.makedirs(pipeline.output_dir, exist_ok=True)
+    
+    if video_path.endswith(('.mp4', '.MP4', '.avi', '.AVI', '.mov', '.MOV')):
+        video_results_vlm = pipeline.process_video_frames(
+            video_path, 
+            extraction_method="scene_change", 
+            use_sam_segmentation=True,
+            save_results=True
+        )
+        print(f"VLM-only video processing: {video_results_vlm['summary']['frames_extracted']} frames extracted")
+        print(f"Total objects detected: {video_results_vlm['summary']['total_objects_detected']}")
+    else:
+        # Process as single image for demonstration
+        video_results_vlm = pipeline.detect_objects(video_path, use_sam_segmentation=True, save_results=True)
+        print(f"VLM-only detection (single image): {len(video_results_vlm['objects'])} objects")
+    
+    print("\n=== Video Processing with Hybrid Detection ===")
+    # Configure pipeline for hybrid detection
+    pipeline.output_dir = "./output/qwen_video_results_hybrid"
+    pipeline.enable_traditional_detectors = True
+    pipeline.traditional_detectors = ['yolo', 'detr']
+    os.makedirs(pipeline.output_dir, exist_ok=True)
+    
+    if video_path.endswith(('.mp4', '.MP4', '.avi', '.AVI', '.mov', '.MOV')):
+        # Standard mode (sequential_mode=False, cropped_sequential_mode=False)
+        pipeline.output_dir = "./output/qwen_video_results_hybrid_standard"
+        os.makedirs(pipeline.output_dir, exist_ok=True)
+        video_results_hybrid_standard = pipeline.process_video_frames(
+            video_path, 
+            extraction_method="scene_change", 
+            use_sam_segmentation=True,
+            save_results=True
+        )
+        print(f"Hybrid video processing (Standard mode): {video_results_hybrid_standard['summary']['frames_extracted']} frames extracted")
+        print(f"Total objects detected: {video_results_hybrid_standard['summary']['total_objects_detected']}")
+        print(f"Traditional detectors used: {video_results_hybrid_standard['summary'].get('traditional_detectors_used', 0)}")
+        
+        # Sequential mode (sequential_mode=True, cropped_sequential_mode=False)
+        pipeline.output_dir = "./output/qwen_video_results_hybrid_sequential"
+        os.makedirs(pipeline.output_dir, exist_ok=True)
+        # Temporarily store original detection method to modify behavior
+        original_detect_hybrid = pipeline.detect_objects_hybrid
+        def sequential_detect_hybrid(*args, **kwargs):
+            kwargs['sequential_mode'] = True
+            kwargs['cropped_sequential_mode'] = False
+            return original_detect_hybrid(*args, **kwargs)
+        pipeline.detect_objects_hybrid = sequential_detect_hybrid
+        video_results_hybrid_sequential = pipeline.process_video_frames(
+            video_path, 
+            extraction_method="scene_change", 
+            use_sam_segmentation=True,
+            save_results=True
+        )
+        # Restore original method
+        pipeline.detect_objects_hybrid = original_detect_hybrid
+        print(f"Hybrid video processing (Sequential mode): {video_results_hybrid_sequential['summary']['frames_extracted']} frames extracted")
+        print(f"Total objects detected: {video_results_hybrid_sequential['summary']['total_objects_detected']}")
+        print(f"Traditional detectors used: {video_results_hybrid_sequential['summary'].get('traditional_detectors_used', 0)}")
+        
+        # Cropped Sequential mode (cropped_sequential_mode=True)
+        pipeline.output_dir = "./output/qwen_video_results_hybrid_cropped_sequential"
+        os.makedirs(pipeline.output_dir, exist_ok=True)
+        # Temporarily store original detection method to modify behavior
+        original_detect_hybrid = pipeline.detect_objects_hybrid
+        def cropped_sequential_detect_hybrid(*args, **kwargs):
+            kwargs['sequential_mode'] = True
+            kwargs['cropped_sequential_mode'] = True
+            return original_detect_hybrid(*args, **kwargs)
+        pipeline.detect_objects_hybrid = cropped_sequential_detect_hybrid
+        video_results_hybrid_cropped = pipeline.process_video_frames(
+            video_path, 
+            extraction_method="scene_change", 
+            use_sam_segmentation=True,
+            save_results=True
+        )
+        # Restore original method
+        pipeline.detect_objects_hybrid = original_detect_hybrid
+        print(f"Hybrid video processing (Cropped Sequential mode): {video_results_hybrid_cropped['summary']['frames_extracted']} frames extracted")
+        print(f"Total objects detected: {video_results_hybrid_cropped['summary']['total_objects_detected']}")
+        print(f"Traditional detectors used: {video_results_hybrid_cropped['summary'].get('traditional_detectors_used', 0)}")
+    else:
+        # Process as single image for demonstration
+        video_results_hybrid = pipeline.detect_objects_hybrid(video_path, use_sam_segmentation=True, save_results=True)
+        print(f"Hybrid detection (single image): {len(video_results_hybrid['objects'])} objects")
+        print(f"Traditional detectors used: {video_results_hybrid['traditional_detectors_used']}")
+    
+    print("\n=== Video Processing Results Comparison ===")
+    print(f"VLM-only results saved to: ./qwen_video_results_vlm_only")
+    print(f"Hybrid Standard mode results saved to: ./qwen_video_results_hybrid_standard")
+    print(f"Hybrid Sequential mode results saved to: ./qwen_video_results_hybrid_sequential")
+    print(f"Hybrid Cropped Sequential mode results saved to: ./qwen_video_results_hybrid_cropped_sequential")
+    print("Results are saved in separate directories for easy comparison.")
+    
+
+def image_example(pipeline):
     # Example: Process a single image with hybrid detection
     image_path = "/home/lkk/Developer/VisionLangAnnotate/VisionLangAnnotateModels/sampledata/sj2.jpg"
     
@@ -2989,10 +3425,20 @@ def main():
     print(f"VLM-only detection: {len(results_vlm['objects'])} objects")
     
     # Hybrid detection (traditional + VLM)
-    results_hybrid = pipeline.detect_objects_hybrid(image_path, use_sam_segmentation=True, sequential_mode=True, save_results=True)
+    #Standard mode (sequential_mode=False, cropped_sequential_mode=False)
+    results_hybrid = pipeline.detect_objects_hybrid(image_path, use_sam_segmentation=True, sequential_mode=False, cropped_sequential_mode=False, save_results=True)
     print(f"Hybrid detection: {len(results_hybrid['objects'])} objects")
     print(f"Traditional detectors used: {results_hybrid['traditional_detectors_used']}")
     
+    #Sequential mode (sequential_mode=True, cropped_sequential_mode=False)
+    results_hybrid = pipeline.detect_objects_hybrid(image_path, use_sam_segmentation=True, sequential_mode=True, cropped_sequential_mode=False, save_results=True)
+    print(f"Hybrid detection Sequential mode: {len(results_hybrid['objects'])} objects")
+    
+    #Cropped Sequential mode (cropped_sequential_mode=True)
+    results_hybrid = pipeline.detect_objects_hybrid(image_path, use_sam_segmentation=True, sequential_mode=True, cropped_sequential_mode=False, save_results=True)
+    print(f"Hybrid detection Cropped Sequential mode: {len(results_hybrid['objects'])} objects")
+
+
     # Display detected objects for hybrid detection
     if results_hybrid['objects']:
         print("\nHybrid Detection Results:")
@@ -3018,69 +3464,29 @@ def main():
                 print(f"  Object {i+1}: Unknown format - {type(obj)}")
     else:
         print("\nNo objects detected in hybrid mode.")
+
+def main():
+    """
+    Example usage of the QwenObjectDetectionPipeline.
+    """
+    # Initialize the pipeline with traditional detectors and SAM segmentation enabled
+    pipeline = QwenObjectDetectionPipeline(
+        model_name="Qwen/Qwen2.5-VL-7B-Instruct",
+        device="cuda",
+        output_dir="./output/qwen_detection_results",
+        enable_sam=True,  # Enable SAM segmentation capabilities
+        enable_traditional_detectors=True,  # Enable traditional object detectors
+        traditional_detectors=['yolo', 'detr']  # Use YOLO and DETR detectors
+    )
     
-    # Example: Process a video with both VLM-only and hybrid detection
-    video_path = "output/dashcam_videos/Parking compliance Vantrue dashcam/20250602_065600_00002_T_A.MP4"
-    
-    # Check if video file exists, otherwise use sample image for demonstration
-    if not os.path.exists(video_path):
-        print(f"Video file not found: {video_path}")
-        print("Using sample image for video processing demonstration...")
-        video_path = image_path  # Use the same sample image
-    
-    # Reuse existing pipeline and modify settings for different detection modes
-    # Save original settings
+    # Save original settings for restoration later
     original_output_dir = pipeline.output_dir
     original_enable_traditional = pipeline.enable_traditional_detectors
     original_traditional_detectors = pipeline.traditional_detectors
     
-    print("\n=== Video Processing with VLM-only Detection ===")
-    # Configure pipeline for VLM-only detection
-    pipeline.output_dir = "./qwen_video_results_vlm_only"
-    pipeline.enable_traditional_detectors = False
-    os.makedirs(pipeline.output_dir, exist_ok=True)
-    
-    # if video_path.endswith(('.mp4', '.MP4', '.avi', '.AVI', '.mov', '.MOV')):
-    #     video_results_vlm = pipeline.process_video_frames(
-    #         video_path, 
-    #         extraction_method="scene_change", 
-    #         use_sam_segmentation=True,
-    #         save_results=True
-    #     )
-    #     print(f"VLM-only video processing: {video_results_vlm['summary']['frames_extracted']} frames extracted")
-    #     print(f"Total objects detected: {video_results_vlm['summary']['total_objects_detected']}")
-    # else:
-    #     # Process as single image for demonstration
-    #     video_results_vlm = pipeline.detect_objects(video_path, use_sam_segmentation=True, save_results=True)
-    #     print(f"VLM-only detection (single image): {len(video_results_vlm['objects'])} objects")
-    
-    print("\n=== Video Processing with Hybrid Detection ===")
-    # Configure pipeline for hybrid detection
-    pipeline.output_dir = "./qwen_video_results_hybrid"
-    pipeline.enable_traditional_detectors = True
-    pipeline.traditional_detectors = ['yolo', 'detr']
-    os.makedirs(pipeline.output_dir, exist_ok=True)
-    
-    if video_path.endswith(('.mp4', '.MP4', '.avi', '.AVI', '.mov', '.MOV')):
-        video_results_hybrid = pipeline.process_video_frames(
-            video_path, 
-            extraction_method="scene_change", 
-            use_sam_segmentation=True,
-            save_results=True
-        )
-        print(f"Hybrid video processing: {video_results_hybrid['summary']['frames_extracted']} frames extracted")
-        print(f"Total objects detected: {video_results_hybrid['summary']['total_objects_detected']}")
-        print(f"Traditional detectors used: {video_results_hybrid['summary'].get('traditional_detectors_used', 0)}")
-    else:
-        # Process as single image for demonstration
-        video_results_hybrid = pipeline.detect_objects_hybrid(video_path, use_sam_segmentation=True, save_results=True)
-        print(f"Hybrid detection (single image): {len(video_results_hybrid['objects'])} objects")
-        print(f"Traditional detectors used: {video_results_hybrid['traditional_detectors_used']}")
-    
-    print("\n=== Video Processing Results Comparison ===")
-    print(f"VLM-only results saved to: ./qwen_video_results_vlm_only")
-    print(f"Hybrid results saved to: ./qwen_video_results_hybrid")
-    print("Results are saved in separate directories for easy comparison.")
+    image_example(pipeline)
+    video_example(pipeline)
+
     
     # Restore original pipeline settings
     pipeline.output_dir = original_output_dir

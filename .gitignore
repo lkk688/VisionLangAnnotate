@@ -195,5 +195,7 @@ my_*
 */*/my_*
 *.json
 qwen_detection_results
+qwen_video_results_vlm_only
+qwen_video_results_hybrid
 ocr_results
 *.pt

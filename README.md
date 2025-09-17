@@ -203,6 +203,79 @@ uvicorn src.main:app --reload
 #Verify at: http://localhost:8000
 ```
 
+## ⚠️ Common Warnings and Solutions
+
+When importing VisionLangAnnotateModels, you may encounter these warnings:
+
+### TensorFlow/CUDA Warnings
+```
+TensorFlow warnings about CUDA, cuDNN, or GPU optimization
+```
+**Solution**: These are informational warnings and don't affect functionality. To suppress them:
+```bash
+export TF_CPP_MIN_LOG_LEVEL=2  # Suppress TensorFlow warnings
+```
+
+### Ollama Utilities Warning
+```
+WARNING: Ollama utilities could not be imported. Ollama-based models will not be available.
+```
+**Solution**: Install Ollama if you need local LLM support:
+```bash
+# Install Ollama
+curl -fsSL https://ollama.ai/install.sh | sh
+# Or visit: https://ollama.ai/download
+```
+
+### vLLM Package Warning
+```
+WARNING: vLLM package is not available. Some VLM features may be limited.
+```
+**Solution**: Install vLLM for enhanced VLM performance (see vLLM Setup Guide below).
+
+## 🚀 vLLM Setup Guide
+
+vLLM provides high-performance inference for Vision Language Models. Follow these steps:
+
+### Prerequisites
+- CUDA-compatible GPU (recommended: RTX 3090, RTX 4090, or better)
+- CUDA 11.8+ or 12.1+
+- Python 3.8-3.11
+
+### Installation
+```bash
+# Method 1: Install from PyPI (recommended)
+pip install vllm
+
+# Method 2: Install with CUDA 12.1 support
+pip install vllm --extra-index-url https://download.pytorch.org/whl/cu121
+
+# Method 3: Install from source (for latest features)
+git clone https://github.com/vllm-project/vllm.git
+cd vllm
+pip install -e .
+```
+
+### Verify Installation
+```python
+# Test vLLM installation
+try:
+    from vllm import LLM, SamplingParams
+    print("vLLM installed successfully!")
+except ImportError as e:
+    print(f"vLLM installation issue: {e}")
+```
+
+### GPU Memory Requirements
+- **7B models**: 16GB+ VRAM
+- **13B models**: 24GB+ VRAM  
+- **70B models**: 80GB+ VRAM (multi-GPU setup)
+
+### Troubleshooting
+- **CUDA out of memory**: Reduce `max_model_len` or use tensor parallelism
+- **Import errors**: Ensure CUDA toolkit matches PyTorch CUDA version
+- **Performance issues**: Enable GPU P2P communication for multi-GPU setups
+
 ```bash
 #Set Up React Frontend
 cd ../frontend
