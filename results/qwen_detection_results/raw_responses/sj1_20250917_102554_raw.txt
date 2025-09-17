@@ -1,0 +1,15 @@
+Image: /home/lkk/Developer/VisionLangAnnotate/VisionLangAnnotateModels/sampledata/sj1.jpg
+Model: Qwen/Qwen2.5-VL-7B-Instruct
+Detection Time: 40.22s
+Objects Found: 7
+
+==================================================
+RESULT_START
+Car: (706,174,783,216) 0.95 white SUV driving
+Car: (827,168,872,218) 0.95 yellow taxi cab stopped
+Traffic signal light: (888,65,901,95) 0.95 red light
+Traffic signal light: (768,73,781,95) 0.95 red light
+Cone: (1298,280,1326,339) 0.95 orange cone on sidewalk
+Street sign: (818,87,850,95) 0.95 street name sign
+Construction sign: (100,274,124,322) 0.95 construction sign on sidewalk
+RESULT_END

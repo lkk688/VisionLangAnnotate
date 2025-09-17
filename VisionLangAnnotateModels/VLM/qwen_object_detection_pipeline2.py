@@ -3418,7 +3418,7 @@ def video_example(pipeline, sample_image_path="./sample_image.jpg"):
 
 def image_example(pipeline):
     # Example: Process a single image with hybrid detection
-    image_path = "/home/lkk/Developer/VisionLangAnnotate/VisionLangAnnotateModels/sampledata/sj2.jpg"
+    image_path = "/home/lkk/Developer/VisionLangAnnotate/VisionLangAnnotateModels/sampledata/sj1.jpg"
     
     # Traditional Qwen2.5-VL only detection
     results_vlm = pipeline.detect_objects(image_path, use_sam_segmentation=True)
@@ -3473,7 +3473,7 @@ def main():
     pipeline = QwenObjectDetectionPipeline(
         model_name="Qwen/Qwen2.5-VL-7B-Instruct",
         device="cuda",
-        output_dir="./output/qwen_detection_results",
+        output_dir="./results/qwen_detection_results",
         enable_sam=True,  # Enable SAM segmentation capabilities
         enable_traditional_detectors=True,  # Enable traditional object detectors
         traditional_detectors=['yolo', 'detr']  # Use YOLO and DETR detectors
@@ -3485,7 +3485,7 @@ def main():
     original_traditional_detectors = pipeline.traditional_detectors
     
     image_example(pipeline)
-    video_example(pipeline)
+    #video_example(pipeline)
 
     
     # Restore original pipeline settings

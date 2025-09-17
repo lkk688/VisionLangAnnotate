@@ -88,6 +88,29 @@ results_hybrid_cropped = pipeline.detect_objects_hybrid(
 print(f"Hybrid detection Cropped Sequential mode: {len(results_hybrid_cropped['objects'])} objects")
 ```
 
+Use sample image "/home/lkk/Developer/VisionLangAnnotate/VisionLangAnnotateModels/sampledata/sj1.jpg" as one example. The complete detection results is shown in `results/qwen_detection_results`
+
+The object detection results of `Qwen2.5-VL only` is shown in the image below:
+![Detection Results](/results/qwen_detection_results/visualizations/sj1_20250917_102554_detection.png)
+The segmentation results is shown in the image below:
+![Segmentation Results](results/qwen_detection_results/segmentations/sj1_20250917_102554_segmentation.png)
+
+
+The object detetion results of hybrid mode 1 `(sequential_mode=False, cropped_sequential_mode=False)` is shown in the image below:
+![Detection Results](/results/qwen_detection_results/visualizations/sj1_20250917_102850_detection.png)
+The segmentation results of hybrid mode 1 is shown in the image below:
+![Segmentation Results](results/qwen_detection_results/segmentations/sj1_20250917_102850_hybrid_segmentation.png)
+
+The object detetion results of hybrid mode 2 `(sequential_mode=True, cropped_sequential_mode=False)` is shown in the image below:
+![Detection Results](results/qwen_detection_results/visualizations/sj1_20250917_103044_detection.png)
+The segmentation results of hybrid mode 2 is shown in the image below:
+![Segmentation Results](results/qwen_detection_results/segmentations/sj1_20250917_103043_hybrid_segmentation.png)
+
+The object detection results of hybrid mode 3 `(cropped_sequential_mode=True)` is shown in the image below:
+![Detection Results](results/qwen_detection_results/visualizations/sj1_20250917_103220_detection.png)
+The segmentation results of hybrid mode 3 is shown in the image below:
+![Segmentation Results](results/qwen_detection_results/segmentations/sj1_20250917_103220_hybrid_segmentation.png)
+
 ### Mode-Specific Advantages
 
 | Mode | Strengths | Use Cases |
