@@ -1,7 +1,0 @@
-Image: /home/lkk/Developer/VisionLangAnnotate/VisionLangAnnotateModels/sampledata/sj1.jpg
-Model: Qwen/Qwen2.5-VL-7B-Instruct
-Detection Time: 3.71s
-Objects Found: 18
-
-==================================================
-No VLM response generated
