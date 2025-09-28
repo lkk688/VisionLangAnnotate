@@ -81,11 +81,13 @@ class VLMVLLMUtility:
         """Initialize vLLM in package mode."""
         default_kwargs = {
             "trust_remote_code": True,
-            "max_model_len": 4096,
+            "max_model_len": 1024,  # Very small context to minimize memory usage
             "limit_mm_per_prompt": {"image": 1},
             "enforce_eager": True,  # Add this to avoid engine core issues
-            "gpu_memory_utilization": 0.8,
-            "allowed_local_media_path": "/home/lkk/Developer/VisionLangAnnotate"  # Allow local image loading
+            "gpu_memory_utilization": 0.25,  # Very conservative memory usage
+            "allowed_local_media_path": "/home/lkk/Developer/VisionLangAnnotate",  # Allow local image loading
+            "disable_log_stats": True,  # Reduce overhead
+            "disable_custom_all_reduce": True  # Reduce memory overhead
         }
         default_kwargs.update(kwargs)
         
