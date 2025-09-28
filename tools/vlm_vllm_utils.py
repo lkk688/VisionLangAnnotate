@@ -25,7 +25,7 @@ from enum import Enum
 
 try:
     from vllm import LLM, SamplingParams
-    from vllm.utils import is_hip
+    #from vllm.utils import is_hip
     VLLM_AVAILABLE = True
 except ImportError:
     VLLM_AVAILABLE = False
@@ -81,8 +81,11 @@ class VLMVLLMUtility:
         """Initialize vLLM in package mode."""
         default_kwargs = {
             "trust_remote_code": True,
-            "max_model_len": 32768,
-            "limit_mm_per_prompt": {"image": 5}
+            "max_model_len": 4096,
+            "limit_mm_per_prompt": {"image": 1},
+            "enforce_eager": True,  # Add this to avoid engine core issues
+            "gpu_memory_utilization": 0.8,
+            "allowed_local_media_path": "/home/lkk/Developer/VisionLangAnnotate"  # Allow local image loading
         }
         default_kwargs.update(kwargs)
         
@@ -448,19 +451,20 @@ class VLMVLLMUtility:
                 **kwargs
             )
             
-            # Create conversation format
-            conversation = [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": prompt},
-                        {"type": "image", "image": img}
-                    ]
-                }
-            ]
+            # Use generate format with proper Qwen2.5-VL prompt format
+            formatted_prompt = f"USER: <image>\n{prompt}\nASSISTANT:"
+            
+            # Create prompt input with multi_modal_data
+            prompt_input = {
+                "prompt": formatted_prompt,
+                "multi_modal_data": {"image": img}
+            }
             
             # Generate response
-            outputs = self.llm.chat(conversation, sampling_params=sampling_params)
+            outputs = self.llm.generate(
+                prompt_input,
+                sampling_params=sampling_params
+            )
             
             end_time = time.time()
             
@@ -605,8 +609,8 @@ def example_usage():
         print(f"Server status: {status}")
         
         # Process an image (you'll need to provide a valid image path)
-        # result = vlm_url.process_image("path/to/your/image.jpg", "What do you see in this image?")
-        # print(f"Result: {result}")
+        result = vlm_url.process_image("VisionLangAnnotateModels/sampledata/sjsupeople.jpg", "What do you see in this image?")
+        print(f"Result: {result}")
         
     except Exception as e:
         print(f"URL mode error: {e}")
@@ -621,8 +625,8 @@ def example_usage():
         )
         
         # Process an image (you'll need to provide a valid image path)
-        # result = vlm_package.process_image("path/to/your/image.jpg", "Describe this image.")
-        # print(f"Result: {result}")
+        result = vlm_package.process_image("VisionLangAnnotateModels/sampledata/sjsupeople.jpg", "Describe this image.")
+        print(f"Result: {result}")
         
     except Exception as e:
         print(f"Package mode error: {e}")
