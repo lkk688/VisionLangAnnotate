@@ -98,12 +98,38 @@ class VLMVLLMUtility:
             raise RuntimeError(f"Failed to initialize vLLM package mode: {str(e)}")
     
     def _validate_server_connection(self):
-        """Validate connection to vLLM server in URL mode."""
+        """Validate connection to vLLM server in URL mode and fetch actual model name."""
         try:
             health_url = f"{self.api_url}/health"
             response = requests.get(health_url, timeout=5)
             if response.status_code == 200:
                 print(f"✅ Connected to vLLM server at {self.api_url}")
+                
+                # Fetch the actual model name from the server
+                try:
+                    models_url = f"{self.api_url}/v1/models"
+                    models_response = requests.get(models_url, timeout=10)
+                    
+                    if models_response.status_code == 200:
+                        models_data = models_response.json()
+                        models = models_data.get("data", [])
+                        
+                        if models:
+                            # Use the first available model from the server
+                            server_model_name = models[0].get("id", self.model_name)
+                            if server_model_name != self.model_name:
+                                print(f"🔄 Updated model name from '{self.model_name}' to '{server_model_name}' (from server)")
+                                self.model_name = server_model_name
+                            else:
+                                print(f"✅ Using model: {self.model_name}")
+                        else:
+                            print(f"⚠️  No models found on server, using default: {self.model_name}")
+                    else:
+                        print(f"⚠️  Could not fetch models from server (status: {models_response.status_code}), using default: {self.model_name}")
+                        
+                except requests.exceptions.RequestException as e:
+                    print(f"⚠️  Could not fetch model info: {str(e)}, using default: {self.model_name}")
+                    
             else:
                 raise ConnectionError(f"Server returned status code: {response.status_code}")
         except requests.exceptions.RequestException as e:

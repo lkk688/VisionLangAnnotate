@@ -1,4 +1,5 @@
 import os
+import sys
 import json
 import re
 import time
@@ -77,6 +78,16 @@ except ImportError:
         import os
         sys.path.append(os.path.dirname(os.path.abspath(__file__)))
         from vlm_classifierv4 import HuggingFaceVLM
+
+# Import the new VLM_utils class
+try:
+    # Try importing from tools directory
+    sys.path.append(os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), 'tools'))
+    from vlm_utils import VLMUtils, VLMBackend
+    VLM_UTILS_AVAILABLE = True
+except ImportError:
+    VLM_UTILS_AVAILABLE = False
+    print("Warning: VLM_utils not available. Only HuggingFaceVLM backend will be supported.")
 
 # Traditional detector classes removed - now using unified ModelInference from detectors.inference
 
@@ -537,7 +548,9 @@ class QwenObjectDetectionPipeline:
                  output_dir: str = "./object_detection_results",
                  enable_sam: bool = False,
                  enable_traditional_detectors: bool = False,
-                 traditional_detectors: List[str] = None):
+                 traditional_detectors: List[str] = None,
+                 vlm_backend: str = "huggingface",
+                 vlm_backend_config: Dict[str, Any] = None):
         """Initialize the object detection pipeline.
         
         Args:
@@ -547,12 +560,16 @@ class QwenObjectDetectionPipeline:
             enable_sam: Whether to enable SAM segmentation capabilities
             enable_traditional_detectors: Whether to enable traditional object detectors
             traditional_detectors: List of traditional detectors to use ['yolo', 'detr', 'rtdetr']
+            vlm_backend: VLM backend to use ('auto', 'huggingface', 'vllm_api', 'vllm_package', 'ollama')
+            vlm_backend_config: Configuration for VLM backend
         """
         self.model_name = model_name
         self.device = device
         self.output_dir = output_dir
         self.enable_sam = enable_sam and SAM_AVAILABLE
         self.enable_traditional_detectors = enable_traditional_detectors
+        self.vlm_backend = vlm_backend
+        self.vlm_backend_config = vlm_backend_config or {}
         
         # Initialize allowed classes for object detection
         # self.allowed_classes = [
@@ -604,9 +621,12 @@ class QwenObjectDetectionPipeline:
             "IMPORTANT: Always wrap your response with RESULT_START and RESULT_END markers. Use ONLY the exact format shown above."
         )
         
-        # Initialize the VLM model
-        print(f"Initializing {model_name}...")
-        self.vlm = HuggingFaceVLM(model_name=model_name, device=device)
+        # Initialize the VLM model with backend selection
+        print(f"Initializing {model_name} with backend: {vlm_backend}...")
+        self.vlm = self._initialize_vlm_backend()
+        
+        # Store backend info for debugging
+        self.vlm_backend_info = self._get_vlm_backend_info()
         
         # Initialize traditional detectors if enabled
         self.traditional_detectors = []
@@ -630,6 +650,101 @@ class QwenObjectDetectionPipeline:
         
         # Create output directories
         self._setup_output_directories()
+    
+    def _initialize_vlm_backend(self):
+        """Initialize the appropriate VLM backend based on configuration."""
+        print(f"Initializing VLM backend: {self.vlm_backend}")
+        
+        if self.vlm_backend == "auto":
+            # Auto-select backend based on availability with intelligent fallback
+            if VLM_UTILS_AVAILABLE:
+                print("Auto-selecting VLM_utils backend with intelligent fallback support")
+                try:
+                    vlm_utils = VLMUtils(
+                        primary_backend=VLMBackend.VLLM_API,
+                        fallback_backends=[VLMBackend.VLLM_PACKAGE, VLMBackend.OLLAMA],
+                        model_name=self.model_name,
+                        **self.vlm_backend_config
+                    )
+                    # Test if initialization was successful
+                    if hasattr(vlm_utils, 'current_backend') and vlm_utils.current_backend:
+                        print(f"Successfully initialized VLM_utils with backend: {vlm_utils.current_backend}")
+                        return vlm_utils
+                    else:
+                        print("VLM_utils initialization failed, falling back to HuggingFaceVLM")
+                        return HuggingFaceVLM(model_name=self.model_name, device=self.device)
+                except Exception as e:
+                    print(f"VLM_utils initialization error: {e}, falling back to HuggingFaceVLM")
+                    return HuggingFaceVLM(model_name=self.model_name, device=self.device)
+            else:
+                print("VLM_utils not available, using HuggingFaceVLM")
+                return HuggingFaceVLM(model_name=self.model_name, device=self.device)
+        
+        elif self.vlm_backend == "huggingface":
+            print("Using HuggingFaceVLM backend")
+            return HuggingFaceVLM(model_name=self.model_name, device=self.device)
+        
+        elif self.vlm_backend in ["vllm_api", "vllm_package", "ollama"]:
+            if not VLM_UTILS_AVAILABLE:
+                print(f"Warning: VLM_utils not available for {self.vlm_backend}, falling back to HuggingFaceVLM")
+                return HuggingFaceVLM(model_name=self.model_name, device=self.device)
+            
+            backend_map = {
+                "vllm_api": VLMBackend.VLLM_API,
+                "vllm_package": VLMBackend.VLLM_PACKAGE,
+                "ollama": VLMBackend.OLLAMA
+            }
+            
+            print(f"Using VLM_utils with {self.vlm_backend} backend")
+            try:
+                vlm_utils = VLMUtils(
+                    primary_backend=backend_map[self.vlm_backend],
+                    fallback_backends=[],  # No fallback for specific backend selection
+                    model_name=self.model_name,
+                    **self.vlm_backend_config
+                )
+                
+                # Verify initialization
+                if hasattr(vlm_utils, 'current_backend') and vlm_utils.current_backend:
+                    print(f"Successfully initialized {self.vlm_backend} backend")
+                    return vlm_utils
+                else:
+                    print(f"Failed to initialize {self.vlm_backend} backend, falling back to HuggingFaceVLM")
+                    return HuggingFaceVLM(model_name=self.model_name, device=self.device)
+            except Exception as e:
+                print(f"Error initializing {self.vlm_backend} backend: {e}, falling back to HuggingFaceVLM")
+                return HuggingFaceVLM(model_name=self.model_name, device=self.device)
+        
+        else:
+            raise ValueError(f"Unknown VLM backend: {self.vlm_backend}. Supported backends: auto, huggingface, vllm_api, vllm_package, ollama")
+    
+    def _get_vlm_backend_info(self) -> Dict[str, Any]:
+        """Get information about the current VLM backend."""
+        if hasattr(self.vlm, 'get_backend_info'):
+            # VLM_utils backend
+            return self.vlm.get_backend_info()
+        else:
+            # HuggingFaceVLM backend
+            return {
+                "backend_type": "HuggingFaceVLM",
+                "model_name": self.model_name,
+                "device": self.device,
+                "status": "active"
+            }
+    
+    def _vlm_generate(self, images: List[Image.Image], prompts: List[str]) -> List[str]:
+        """Unified interface for VLM generation across different backends."""
+        try:
+            if hasattr(self.vlm, 'process_multiple_images'):
+                # VLM_utils backend
+                return self.vlm.process_multiple_images(images, prompts)
+            else:
+                # HuggingFaceVLM backend
+                return self.vlm.generate(images, prompts)
+        except Exception as e:
+            print(f"Error in VLM generation: {e}")
+            # Return empty responses for failed generations
+            return ["Error: VLM generation failed"] * len(prompts)
     
     def _initialize_traditional_detectors(self, detector_names: List[str]):
         """Initialize traditional object detectors using unified ModelInference."""
@@ -727,26 +842,26 @@ class QwenObjectDetectionPipeline:
         
         prompt = (
             f"Analyze the objects inside these specific bounding boxes in the image: {bbox_list}\n\n"
-            "For each bounding box, identify what object is inside it. If a box contains no clear object or is empty, respond with 'Empty' for that box.\n\n"
+            "For each bounding box, identify what object is inside it and provide the bounding box coordinates. If a box contains no clear object or is empty, respond with 'Empty' for that box.\n\n"
             "REQUIRED FORMAT (one result per bounding box, in the same order as given):\n"
             "RESULT_START\n"
-            "BOX_INDEX_0: Object_name confidence description\n"
-            "BOX_INDEX_1: Object_name confidence description\n"
-            "BOX_INDEX_2: Object_name confidence description\n"
+            "Object_name: (x1,y1,x2,y2) confidence description\n"
+            "Object_name: (x1,y1,x2,y2) confidence description\n"
+            "Object_name: (x1,y1,x2,y2) confidence description\n"
             "RESULT_END\n\n"
             "EXAMPLES:\n"
             "RESULT_START\n"
-            "BOX_INDEX_0: Car 0.95 red sedan parked\n"
-            "BOX_INDEX_1: Tree 0.88 large oak tree\n"
-            "BOX_INDEX_2: Empty 0.0 no clear object visible\n"
+            "Car: (100,50,200,150) 0.95 red sedan parked\n"
+            "Tree: (300,20,350,180) 0.88 large oak tree\n"
+            "Empty: (0,0,0,0) 0.0 no clear object visible\n"
             "RESULT_END\n\n"
             "ALLOWED CLASSES (use ONLY these exact names):\n"
             f"{', '.join(self.allowed_classes)}\n\n"
             "IMPORTANT: Use ONLY the allowed class names listed above. If an object doesn't match any allowed class, use 'Other'.\n"
-            "IMPORTANT: If a bounding box contains no clear object, use 'Empty' as the class name.\n"
-            "IMPORTANT: Analyze each bounding box in the exact order provided (BOX_INDEX_0, BOX_INDEX_1, etc.).\n"
+            "IMPORTANT: If a bounding box contains no clear object, use 'Empty' as the class name with coordinates (0,0,0,0).\n"
+            "IMPORTANT: Analyze each bounding box in the exact order provided and use the same coordinates from the input bounding boxes.\n"
             "IMPORTANT: Use ONLY the exact format shown above with RESULT_START and RESULT_END markers.\n"
-            "IMPORTANT: Do NOT include coordinate numbers in your response, only use BOX_INDEX_N format."
+            "IMPORTANT: Always include the bounding box coordinates (x1,y1,x2,y2) in your response for each detected object."
         )
         
         return prompt
@@ -770,6 +885,11 @@ class QwenObjectDetectionPipeline:
         # Try new structured format first
         if "RESULT_START" in response and "RESULT_END" in response:
             return self._parse_structured_response(response, original_boxes)
+        
+        # Try direct coordinate format (Object: (x1,y1,x2,y2) confidence description)
+        direct_format_detections = self._parse_direct_coordinate_format(response, original_boxes)
+        if direct_format_detections:
+            return direct_format_detections
         
         # Fallback to old format parsing for backward compatibility
         return self._parse_legacy_response(response, original_boxes)
@@ -831,6 +951,88 @@ class QwenObjectDetectionPipeline:
             # If no analysis found for this box, skip it (considered empty)
             if not found_analysis:
                 print(f"Warning: No VLM analysis found for BOX_INDEX_{i} (box {x1},{y1},{x2},{y2})")
+        
+        return detections
+    
+    def _parse_direct_coordinate_format(self, response: str, original_boxes: List[Tuple[int, int, int, int]]) -> List[Dict[str, Any]]:
+        """
+        Parse VLM response in direct coordinate format: Object: (x1,y1,x2,y2) confidence description
+        """
+        detections = []
+        
+        # Extract content between RESULT_START and RESULT_END if present
+        if "RESULT_START" in response:
+            start_idx = response.find("RESULT_START")
+            if "RESULT_END" in response:
+                end_idx = response.find("RESULT_END")
+                result_content = response[start_idx + len("RESULT_START"):end_idx].strip()
+            else:
+                # Handle truncated response
+                result_content = response[start_idx + len("RESULT_START"):].strip()
+        else:
+            result_content = response.strip()
+        
+        lines = [line.strip() for line in result_content.split('\n') if line.strip()]
+        
+        # Parse each line with format: Object: (x1,y1,x2,y2) confidence description
+        import re
+        pattern = re.compile(r'(\w+):\s*\((\d+),\s*(\d+),\s*(\d+),\s*(\d+)\)\s+([\d.]+)\s*(.*)')
+        
+        parsed_detections = []
+        for line in lines:
+            match = pattern.match(line)
+            if match:
+                label = match.group(1)
+                x1, y1, x2, y2 = int(match.group(2)), int(match.group(3)), int(match.group(4)), int(match.group(5))
+                confidence = float(match.group(6))
+                description = match.group(7).strip() if match.group(7) else f"Detected by VLM: {label}"
+                
+                parsed_detections.append({
+                    'label': label,
+                    'bbox': [x1, y1, x2, y2],
+                    'confidence': confidence,
+                    'description': description
+                })
+        
+        # Match parsed detections to original boxes by finding closest matches
+        for orig_x1, orig_y1, orig_x2, orig_y2 in original_boxes:
+            best_match = None
+            min_distance = float('inf')
+            
+            for detection in parsed_detections:
+                det_x1, det_y1, det_x2, det_y2 = detection['bbox']
+                
+                # Calculate IoU for better matching
+                iou = self._calculate_iou([orig_x1, orig_y1, orig_x2, orig_y2], [det_x1, det_y1, det_x2, det_y2])
+                
+                # Also calculate center distance as fallback
+                orig_center = ((orig_x1 + orig_x2) / 2, (orig_y1 + orig_y2) / 2)
+                det_center = ((det_x1 + det_x2) / 2, (det_y1 + det_y2) / 2)
+                distance = ((orig_center[0] - det_center[0]) ** 2 + (orig_center[1] - det_center[1]) ** 2) ** 0.5
+                
+                # Prefer IoU matching, fallback to distance
+                if iou > 0.3:  # Good IoU match
+                    score = iou
+                elif distance < min_distance:
+                    score = 1.0 / (1.0 + distance)  # Convert distance to similarity score
+                else:
+                    continue
+                
+                if iou > 0.3 or (best_match is None and distance < 100):  # Reasonable thresholds
+                    best_match = detection
+                    min_distance = distance
+            
+            if best_match:
+                # Map to allowed classes
+                mapped_label = self._map_vlm_to_allowed_classes(best_match['label'])
+                
+                detections.append({
+                    'label': mapped_label,
+                    'bbox': [orig_x1, orig_y1, orig_x2, orig_y2],  # Use original box coordinates
+                    'confidence': best_match['confidence'],
+                    'description': best_match['description'],
+                    'source': 'vlm_sequential'
+                })
         
         return detections
     
@@ -1087,10 +1289,7 @@ RESULT_END"""
                 print(f"Analyzing cropped region {i+1}/{len(traditional_detections)}: {detection['label']} at ({x1},{y1},{x2},{y2})")
                 
                 # Get VLM classification for this cropped region
-                vlm_response = self.vlm.generate_response(
-                    image=cropped_image,
-                    prompt=prompt
-                )
+                vlm_response = self._vlm_generate([cropped_image], [prompt])[0]
                 
                 # Parse VLM response
                 classification_result = self._parse_cropped_classification_response(vlm_response)
@@ -1143,7 +1342,8 @@ RESULT_END"""
         response = response.strip()
         
         # Method 1: Try new structured format with RESULT_START/RESULT_END markers
-        if "RESULT_START" in response and "RESULT_END" in response:
+        # Also handle truncated responses that only have RESULT_START
+        if "RESULT_START" in response:
             objects = self._parse_structured_detection_response(response, image_width, image_height)
             if objects is not None:  # None means parsing failed, empty list means no objects
                 return objects
@@ -1192,17 +1392,26 @@ RESULT_END"""
             start_idx = response.find(start_marker)
             end_idx = response.find(end_marker)
             
-            if start_idx == -1 or end_idx == -1 or start_idx >= end_idx:
+            # Handle truncated responses without RESULT_END marker
+            if start_idx == -1:
                 return None
             
-            # Extract the content between markers
-            content = response[start_idx + len(start_marker):end_idx].strip()
+            if end_idx == -1:
+                # Truncated response - use everything after RESULT_START
+                print("Warning: VLM response appears to be truncated (no RESULT_END marker found)")
+                content = response[start_idx + len(start_marker):].strip()
+            else:
+                if start_idx >= end_idx:
+                    return None
+                # Normal case with both markers
+                content = response[start_idx + len(start_marker):end_idx].strip()
             
             # Handle "No objects detected" case
             if "no objects detected" in content.lower():
                 return []
             
             detections = []
+            seen_detections = set()  # Track duplicates using bbox coordinates
             lines = content.split('\n')
             
             for line in lines:
@@ -1211,27 +1420,46 @@ RESULT_END"""
                     continue
                 
                 # Parse format: Object_name: (x1,y1,x2,y2) confidence description
-                match = re.match(r'^([^:]+):\s*\((\d+),(\d+),(\d+),(\d+)\)\s*([\d.]+)?\s*(.*)$', line)
+                # Use more robust regex that handles potential parsing issues
+                match = re.match(r'^([^:]+):\s*\((\d+),\s*(\d+),\s*(\d+),\s*(\d+)\)\s*([\d.]+)?\s*(.*)$', line)
                 if match:
-                    label = match.group(1).strip()
-                    x1, y1, x2, y2 = map(int, match.groups()[1:5])
-                    confidence = float(match.group(6)) if match.group(6) else 0.8
-                    description = match.group(7).strip() if match.group(7) else f"Detected {label.lower()}"
-                    
-                    # Validate bounding box
-                    if self._validate_bbox(x1, y1, x2, y2, image_width, image_height):
-                        # Map VLM detected class to allowed classes
-                        mapped_label = self._map_vlm_to_allowed_classes(label)
+                    try:
+                        label = match.group(1).strip()
+                        x1, y1, x2, y2 = map(int, match.groups()[1:5])
                         
-                        detections.append({
-                            'label': mapped_label,
-                            'bbox': [x1, y1, x2, y2],
-                            'confidence': confidence,
-                            'description': description,
-                            'original_vlm_label': label
-                        })
-                    else:
-                        print(f"Warning: Invalid bounding box for {label}: ({x1},{y1},{x2},{y2})")
+                        # Create a unique key for this detection to filter duplicates
+                        detection_key = (label, x1, y1, x2, y2)
+                        if detection_key in seen_detections:
+                            continue  # Skip duplicate detection
+                        seen_detections.add(detection_key)
+                        
+                        confidence_str = match.group(6)
+                        confidence = float(confidence_str) if confidence_str and confidence_str.strip() else 0.8
+                        description = match.group(7).strip() if match.group(7) else f"Detected {label.lower()}"
+                        
+                        # Validate bounding box
+                        if self._validate_bbox(x1, y1, x2, y2, image_width, image_height):
+                            # Map VLM detected class to allowed classes
+                            mapped_label = self._map_vlm_to_allowed_classes(label)
+                            
+                            detections.append({
+                                'label': mapped_label,
+                                'bbox': [x1, y1, x2, y2],
+                                'confidence': confidence,
+                                'description': description,
+                                'original_vlm_label': label
+                            })
+                        else:
+                            print(f"Warning: Invalid bounding box for {label}: ({x1},{y1},{x2},{y2})")
+                    except (ValueError, TypeError) as e:
+                        print(f"Warning: Failed to parse detection line '{line}': {e}")
+                        continue
+                else:
+                    # Try to handle incomplete/truncated lines
+                    incomplete_match = re.match(r'^([^:]+):\s*\((\d+)(?:,\s*(\d+)(?:,\s*(\d+)(?:,\s*(\d+))?)?)?\)?', line)
+                    if incomplete_match and line.endswith('(') or '(' in line:
+                        print(f"Warning: Detected incomplete/truncated detection line: '{line}'")
+                        continue
             
             return detections
             
@@ -1257,7 +1485,7 @@ RESULT_END"""
                 continue
             
             # Pattern: Object: (x,y,x,y) confidence description
-            match = re.match(r'^([^:]+):\s*\((\d+),(\d+),(\d+),(\d+)\)\s*([\d.]+)?\s*(.*)$', line)
+            match = re.match(r'^([^:]+):\s*\((\d+),\s*(\d+),\s*(\d+),\s*(\d+)\)\s*([\d.]+)?\s*(.*)$', line)
             if match:
                 label = match.group(1).strip()
                 x1, y1, x2, y2 = map(int, match.groups()[1:5])
@@ -1559,10 +1787,17 @@ RESULT_END"""
             Dictionary with keys x1, y1, x2, y2
         """
         if isinstance(bbox, list) and len(bbox) == 4:
-            return {'x1': bbox[0], 'y1': bbox[1], 'x2': bbox[2], 'y2': bbox[3]}
+            # Validate that bbox contains numeric values, not strings
+            try:
+                x1, y1, x2, y2 = float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3])
+                return {'x1': x1, 'y1': y1, 'x2': x2, 'y2': y2}
+            except (ValueError, TypeError) as e:
+                print(f"Warning: Invalid bbox coordinates: {bbox}. Error: {e}")
+                return {}
         elif isinstance(bbox, dict):
             return bbox
         else:
+            print(f"Warning: Invalid bbox format: {bbox}")
             return {}
     
     def _detect_faces_and_plates(self, objects: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
@@ -1682,13 +1917,26 @@ RESULT_END"""
                 continue
                 
             bbox = obj['bbox']
-            # Handle both list and dict bbox formats
-            if isinstance(bbox, list) and len(bbox) >= 4:
-                x1, y1, x2, y2 = bbox[:4]
-            elif isinstance(bbox, dict) and all(key in bbox for key in ['x1', 'y1', 'x2', 'y2']):
-                x1, y1, x2, y2 = bbox['x1'], bbox['y1'], bbox['x2'], bbox['y2']
-            else:
-                continue  # Skip objects with invalid bbox format
+            
+            # Validate bbox format and content
+            if not isinstance(bbox, list) or len(bbox) < 4:
+                print(f"Warning: Invalid bbox format for object {i}: {bbox}. Skipping Label Studio conversion.")
+                continue
+            
+            # Handle both list and dict bbox formats with validation
+            try:
+                if isinstance(bbox, list) and len(bbox) >= 4:
+                    # Check if bbox contains numeric values (not strings)
+                    x1, y1, x2, y2 = float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3])
+                elif isinstance(bbox, dict) and all(key in bbox for key in ['x1', 'y1', 'x2', 'y2']):
+                    x1, y1, x2, y2 = float(bbox['x1']), float(bbox['y1']), float(bbox['x2']), float(bbox['y2'])
+                else:
+                    print(f"Warning: Invalid bbox format for object {i}: {bbox}. Skipping Label Studio conversion.")
+                    continue
+            except (ValueError, TypeError) as e:
+                print(f"Warning: Invalid bbox coordinates for object {i}: {bbox}. Error: {e}. Skipping Label Studio conversion.")
+                print(f"Object structure: {obj}")
+                continue
                 
             # Get label with fallback
             label = obj.get('label', obj.get('class', 'unknown'))
@@ -1767,8 +2015,19 @@ RESULT_END"""
             # Skip invalid objects (empty lists, None, non-dict objects, or those without 'bbox')
             if not obj or not isinstance(obj, dict) or 'bbox' not in obj:
                 continue
-                
-            x1, y1, x2, y2 = obj['bbox']
+            
+            # Validate bbox format and content
+            bbox = obj['bbox']
+            if not isinstance(bbox, list) or len(bbox) != 4:
+                print(f"Warning: Invalid bbox format for visualization object {i}: {bbox}. Skipping visualization.")
+                continue
+            
+            try:
+                # Ensure all bbox values are numeric
+                x1, y1, x2, y2 = [float(coord) for coord in bbox]
+            except (ValueError, TypeError) as e:
+                print(f"Warning: Invalid bbox coordinates for visualization object {i}: {bbox}. Error: {e}. Skipping visualization.")
+                continue
             color = colors[i % len(colors)]
             
             # Create rectangle patch
@@ -1862,7 +2121,7 @@ RESULT_END"""
                 
                 try:
                     prompts = [self.detection_prompt] * len(valid_images)
-                    responses = self.vlm.generate(valid_images, prompts)
+                    responses = self._vlm_generate(valid_images, prompts)
                     batch_inference_time = time.time() - start_time
                     print(f"Batch inference completed in {batch_inference_time:.2f} seconds")
                 except Exception as e:
@@ -1986,7 +2245,7 @@ RESULT_END"""
             
             # Generate description using VLM
             try:
-                responses = self.vlm.generate([image], [description_prompt])
+                responses = self._vlm_generate([image], [description_prompt])
                 description = responses[0] if responses else "No description generated"
                 return description.strip()
             except Exception as e:
@@ -2128,30 +2387,32 @@ RESULT_END"""
                             # Handle fallback DETR/RT-DETR detector (dict format)
                             elif isinstance(detector, dict) and 'type' in detector:
                                 if detector['type'] == 'detr':
-                                    inputs = detector['processor'](images=img, return_tensors="pt")
-                                    outputs = detector['model'](**inputs)
-                                    target_sizes = torch.tensor([img.size[::-1]])
-                                    results = detector['processor'].post_process_object_detection(outputs, target_sizes=target_sizes, threshold=0.5)[0]
+                                    with torch.no_grad():
+                                        inputs = detector['processor'](images=img, return_tensors="pt")
+                                        outputs = detector['model'](**inputs)
+                                        target_sizes = torch.tensor([img.size[::-1]])
+                                        results = detector['processor'].post_process_object_detection(outputs, target_sizes=target_sizes, threshold=0.5)[0]
                                     detections = []
                                     for score, label, box in zip(results["scores"], results["labels"], results["boxes"]):
                                         x1, y1, x2, y2 = box.cpu().numpy()
                                         detections.append({
                                             'bbox': [int(x1), int(y1), int(x2), int(y2)],
-                                            'confidence': float(score),
-                                            'label': detector['model'].config.id2label[int(label)]
+                                            'confidence': float(score.cpu()),
+                                            'label': detector['model'].config.id2label[int(label.cpu())]
                                         })
                                 elif detector['type'] == 'rtdetr':
-                                    inputs = detector['processor'](images=img, return_tensors="pt")
-                                    outputs = detector['model'](**inputs)
-                                    target_sizes = torch.tensor([img.size[::-1]])
-                                    results = detector['processor'].post_process_object_detection(outputs, target_sizes=target_sizes, threshold=0.5)[0]
+                                    with torch.no_grad():
+                                        inputs = detector['processor'](images=img, return_tensors="pt")
+                                        outputs = detector['model'](**inputs)
+                                        target_sizes = torch.tensor([img.size[::-1]])
+                                        results = detector['processor'].post_process_object_detection(outputs, target_sizes=target_sizes, threshold=0.5)[0]
                                     detections = []
                                     for score, label, box in zip(results["scores"], results["labels"], results["boxes"]):
                                         x1, y1, x2, y2 = box.cpu().numpy()
                                         detections.append({
                                             'bbox': [int(x1), int(y1), int(x2), int(y2)],
-                                            'confidence': float(score),
-                                            'label': detector['model'].config.id2label[int(label)]
+                                            'confidence': float(score.cpu()),
+                                            'label': detector['model'].config.id2label[int(label.cpu())]
                                         })
                             else:
                                 # Fallback to original detect method if available
@@ -2229,7 +2490,7 @@ RESULT_END"""
                             batch_prompts.append(self.detection_prompt)
                     
                     try:
-                        responses = self.vlm.generate(valid_images, batch_prompts)
+                        responses = self._vlm_generate(valid_images, batch_prompts)
                         batch_vlm_responses = responses
                     except Exception as e:
                         print(f"Warning: Sequential VLM batch inference failed: {str(e)}")
@@ -2241,7 +2502,7 @@ RESULT_END"""
                     
                     try:
                         prompts = [self.detection_prompt] * len(valid_images)
-                        responses = self.vlm.generate(valid_images, prompts)
+                        responses = self._vlm_generate(valid_images, prompts)
                         batch_inference_time = time.time() - start_time
                         print(f"Batch VLM inference completed in {batch_inference_time:.2f} seconds")
                         batch_vlm_responses = responses
@@ -2394,7 +2655,7 @@ RESULT_END"""
                     'segmentation_masks': segmentation_masks,
                     'segmentation_visualization_path': segmentation_visualization_path,
                     'model_name': self.model_name,
-                    'raw_response': batch_vlm_responses[vlm_response_idx] if vlm_response_idx < len(batch_vlm_responses) else 'No VLM response generated',
+                    'raw_response': batch_vlm_responses[vlm_response_idx - 1] if vlm_response_idx <= len(batch_vlm_responses) else 'No VLM response generated',
                     'image_width': metadata['width'],
                     'image_height': metadata['height']
                 }
@@ -3066,7 +3327,21 @@ RESULT_END"""
                     continue
                     
                 bbox = obj['bbox']
-                x1, y1, x2, y2 = int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3])
+                
+                # Validate bbox format and content
+                if not isinstance(bbox, list) or len(bbox) < 4:
+                    print(f"Warning: Invalid bbox format for object {i}: {bbox}. Skipping SAM segmentation.")
+                    continue
+                
+                # Check if bbox contains numeric values (not strings)
+                try:
+                    # Attempt to convert to numbers - this will fail if bbox contains strings
+                    x1, y1, x2, y2 = float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3])
+                    x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
+                except (ValueError, TypeError) as e:
+                    print(f"Warning: Invalid bbox coordinates for object {i}: {bbox}. Error: {e}. Skipping SAM segmentation.")
+                    print(f"Object structure: {obj}")
+                    continue
                 
                 # Extract the bounding box region from the image
                 bbox_region = image.crop((x1, y1, x2, y2))
@@ -3093,11 +3368,11 @@ RESULT_END"""
                     outputs.pred_masks.cpu(), 
                     inputs["original_sizes"].cpu(), 
                     inputs["reshaped_input_sizes"].cpu()
-                )
+                )#bool [1, 3, 50, 66]
                 
                 if masks and len(masks[0]) > 0:
                     # Get the first mask (best segmentation)
-                    mask = masks[0][0]
+                    mask = masks[0][0] #[3, 50, 66]
                     
                     # Convert mask to numpy
                     if isinstance(mask, torch.Tensor):
@@ -3210,7 +3485,18 @@ RESULT_END"""
                     
                     # Draw updated bounding box in bold
                     bbox = obj['bbox']
-                    x1, y1, x2, y2 = bbox
+                    
+                    # Validate bbox format before processing
+                    try:
+                        if isinstance(bbox, list) and len(bbox) >= 4:
+                            x1, y1, x2, y2 = float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3])
+                            x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
+                        else:
+                            print(f"Warning: Invalid bbox format for object {i}: {bbox}. Skipping visualization.")
+                            continue
+                    except (ValueError, TypeError) as e:
+                        print(f"Warning: Invalid bbox coordinates for object {i}: {bbox}. Error: {e}. Skipping visualization.")
+                        continue
                     color = bbox_colors[i % len(bbox_colors)]
                     draw.rectangle([x1, y1, x2, y2], outline=color, width=3)
                     
@@ -3458,10 +3744,8 @@ def video_example(pipeline, sample_image_path="./sample_image.jpg"):
     print("Results are saved in separate directories for easy comparison.")
     
 
-def image_example(pipeline):
+def image_example(pipeline, image_path):
     # Example: Process a single image with hybrid detection
-    image_path = "/home/lkk/Developer/VisionLangAnnotate/VisionLangAnnotateModels/sampledata/sj1.jpg"
-    
     # Traditional Qwen2.5-VL only detection
     results_vlm = pipeline.detect_objects(image_path, use_sam_segmentation=True)
     print(f"VLM-only detection: {len(results_vlm['objects'])} objects")
@@ -3497,7 +3781,12 @@ def image_example(pipeline):
                 if bbox and len(bbox) >= 4:
                     # Handle both list and nested dict bbox formats
                     if isinstance(bbox, list) and len(bbox) >= 4:
-                        print(f"    Bounding box: [{bbox[0]:.1f}, {bbox[1]:.1f}, {bbox[2]:.1f}, {bbox[3]:.1f}]")
+                        try:
+                            # Validate bbox contains numeric values before printing
+                            x1, y1, x2, y2 = float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3])
+                            print(f"    Bounding box: [{x1:.1f}, {y1:.1f}, {x2:.1f}, {y2:.1f}]")
+                        except (ValueError, TypeError) as e:
+                            print(f"    Bounding box: Invalid format - {bbox} (Error: {e})")
                     
                 # Show mask information if available
                 if 'mask_shape' in obj:
@@ -3518,7 +3807,8 @@ def main():
         output_dir="./results/qwen_detection_results",
         enable_sam=True,  # Enable SAM segmentation capabilities
         enable_traditional_detectors=True,  # Enable traditional object detectors
-        traditional_detectors=['yolo', 'detr']  # Use YOLO and DETR detectors
+        traditional_detectors=['yolo', 'detr'],  # Use YOLO and DETR detectors
+        vlm_backend="huggingface"
     )
     
     # Save original settings for restoration later
@@ -3526,7 +3816,8 @@ def main():
     original_enable_traditional = pipeline.enable_traditional_detectors
     original_traditional_detectors = pipeline.traditional_detectors
     
-    image_example(pipeline)
+    image_path = "VisionLangAnnotateModels/sampledata/sj1.jpg"
+    image_example(pipeline, image_path)
     #video_example(pipeline)
 
     
@@ -3554,3 +3845,16 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+# # Auto backend selection (recommended)
+# pipeline = QwenObjectDetectionPipeline(vlm_backend="auto")
+
+# # Specific backend with configuration
+# pipeline = QwenObjectDetectionPipeline(
+#     vlm_backend="vllm_api",
+#     vlm_backend_config={"api_url": "http://localhost:8000"}
+# )
+
+# # Traditional HuggingFace backend
+# pipeline = QwenObjectDetectionPipeline(vlm_backend="huggingface")

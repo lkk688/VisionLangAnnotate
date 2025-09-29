@@ -500,7 +500,13 @@ class HuggingFaceVLM(VLMBackend):
             
             # Generate response
             with torch.no_grad():
-                generated_ids = self.model.generate(**inputs, max_new_tokens=256)  # Increased token limit for multiple responses
+                generated_ids = self.model.generate(**inputs, 
+                    max_new_tokens=512,
+                    temperature=0.1,          # ✅ lower temp = more deterministic (good for detection)
+                    top_p=0.8,                # optional
+                    do_sample=False,          # ✅ deterministic output helps structured tasks
+                    eos_token_id=self.processor.tokenizer.eos_token_id
+                    )  # Increased token limit for multiple responses
             
             # Decode the output
             try:

@@ -20,7 +20,9 @@ vllm serve Qwen/Qwen2.5-VL-7B-Instruct-AWQ \
     --port 8000 \
     --limit-mm-per-prompt '{"image": 5}' \
     --quantization awq \
-    --max-model-len 32768
+    --dtype float16 \
+    --max-model-len 8192 \
+    --gpu-memory-utilization 0.80
 
 vllm serve RedHatAI/Qwen2.5-VL-7B-Instruct-FP8-Dynamic \
     --host 0.0.0.0 \
