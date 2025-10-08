@@ -8,6 +8,7 @@ import os
 import sys
 import shutil
 import glob
+import json
 from argparse import ArgumentParser
 from typing import List, Dict, Any
 
@@ -97,6 +98,260 @@ def _is_video_file(filename):
     """Check if the file is a video file"""
     video_extensions = ['.mp4', '.avi', '.mkv', '.mov', '.wmv', '.flv', '.webm', '.mpeg']
     return any(filename.lower().endswith(ext) for ext in video_extensions)
+
+
+def refresh_video_list():
+    """Refresh the list of available videos from the dashcam directory"""
+    video_dir = "/home/lkk/Developer/VisionLangAnnotate/output/dashcam_videos/Parking compliance Vantrue dashcam"
+    
+    if not os.path.exists(video_dir):
+        return gr.Dropdown(choices=[], value=None)
+    
+    try:
+        video_files = []
+        for file in os.listdir(video_dir):
+            if _is_video_file(file):
+                video_files.append(file)
+        
+        video_files.sort()  # Sort alphabetically
+        return gr.Dropdown(choices=video_files, value=None)
+    except Exception as e:
+        print(f"Error refreshing video list: {e}")
+        return gr.Dropdown(choices=[], value=None)
+
+
+def get_video_results_folders(video_name):
+    """Get all result folders for a given video"""
+    if not video_name:
+        return []
+    
+    # Remove extension from video name to match folder naming
+    video_base = os.path.splitext(video_name)[0]
+    results_dir = "/home/lkk/Developer/VisionLangAnnotate/output/qwen_video_results"
+    
+    if not os.path.exists(results_dir):
+        return []
+    
+    try:
+        matching_folders = []
+        for folder in os.listdir(results_dir):
+            if folder.startswith(video_base) and os.path.isdir(os.path.join(results_dir, folder)):
+                matching_folders.append(folder)
+        
+        matching_folders.sort()  # Sort by frame order
+        return matching_folders
+    except Exception as e:
+        print(f"Error getting video results folders: {e}")
+        return []
+
+
+def load_frame_results(frame_folder):
+    """Load visualization images and JSON data for a specific frame"""
+    results_dir = "/home/lkk/Developer/VisionLangAnnotate/output/qwen_video_results"
+    frame_path = os.path.join(results_dir, frame_folder)
+    
+    images = []
+    json_data = None
+    json_file_path = None
+    
+    try:
+        # Create temp directory in current working directory for images
+        temp_dir = os.path.join(os.getcwd(), "temp_images")
+        os.makedirs(temp_dir, exist_ok=True)
+        
+        # Load visualization images and copy to temp directory
+        viz_dir = os.path.join(frame_path, "visualizations")
+        if os.path.exists(viz_dir):
+            for file in os.listdir(viz_dir):
+                if file.lower().endswith(('.png', '.jpg', '.jpeg')):
+                    src_path = os.path.join(viz_dir, file)
+                    temp_path = os.path.join(temp_dir, file)
+                    shutil.copy2(src_path, temp_path)
+                    images.append(temp_path)
+        
+        # Load JSON annotations and copy to temp directory
+        json_dir = os.path.join(frame_path, "json_annotations")
+        if os.path.exists(json_dir):
+            for file in os.listdir(json_dir):
+                if file.lower().endswith('.json'):
+                    src_json_path = os.path.join(json_dir, file)
+                    temp_json_path = os.path.join(temp_dir, file)
+                    shutil.copy2(src_json_path, temp_json_path)
+                    json_file_path = temp_json_path
+                    try:
+                        with open(src_json_path, 'r') as f:
+                            json_data = json.load(f)
+                    except Exception as e:
+                        print(f"Error loading JSON file {src_json_path}: {e}")
+                    break
+        
+        return images, json_data, json_file_path
+    except Exception as e:
+        print(f"Error loading frame results: {e}")
+        return [], None, None
+
+
+def on_video_selected(video_name):
+    """Handle video selection - check for existing results and display them"""
+    if not video_name:
+        return (
+            gr.Gallery(visible=False),
+            gr.File(visible=False),
+            gr.JSON(visible=False),
+            gr.Markdown("**No processed results found for this video.**\n\nSelect a video and click 'Process Video' to generate analysis results.", visible=True),
+            gr.Textbox(value="No frame selected"),
+            gr.Button(interactive=False),
+            gr.Button(interactive=False)
+        )
+    
+    # Get all result folders for this video
+    result_folders = get_video_results_folders(video_name)
+    
+    if not result_folders:
+        return (
+            gr.Gallery(visible=False),
+            gr.File(visible=False),
+            gr.JSON(visible=False),
+            gr.Markdown("**No processed results found for this video.**\n\nSelect a video and click 'Process Video' to generate analysis results.", visible=True),
+            gr.Textbox(value="No frame selected"),
+            gr.Button(interactive=False),
+            gr.Button(interactive=False)
+        )
+    
+    # Load the first frame's results
+    first_frame = result_folders[0]
+    images, json_data, json_file_path = load_frame_results(first_frame)
+    
+    return (
+        gr.Gallery(value=images, visible=True if images else False),
+        gr.File(value=json_file_path, visible=True if json_file_path else False),
+        gr.JSON(value=json_data, visible=True if json_data else False),
+        gr.Markdown(visible=False),
+        gr.Textbox(value=f"Frame 1 of {len(result_folders)}: {first_frame}"),
+        gr.Button(interactive=len(result_folders) > 1),
+        gr.Button(interactive=len(result_folders) > 1)
+    )
+
+
+def play_selected_video(video_name):
+    """Load and display the selected video for playback"""
+    if not video_name:
+        return gr.Video(visible=False)
+    
+    video_path = f"/home/lkk/Developer/VisionLangAnnotate/output/dashcam_videos/Parking compliance Vantrue dashcam/{video_name}"
+    
+    if os.path.exists(video_path):
+        return gr.Video(value=video_path, visible=True)
+    else:
+        return gr.Video(visible=False)
+
+
+def process_selected_video(video_name, task_type):
+    """Process the selected video using the existing pipeline"""
+    if not video_name:
+        return (
+            gr.Textbox(value="No video selected", visible=True),
+            gr.Gallery(visible=False),
+            gr.File(visible=False),
+            gr.JSON(visible=False),
+            gr.Markdown("**No processed results found for this video.**\n\nSelect a video and click 'Process Video' to generate analysis results.", visible=True),
+            gr.Textbox(value="No frame selected")
+        )
+    
+    video_path = f"/home/lkk/Developer/VisionLangAnnotate/output/dashcam_videos/Parking compliance Vantrue dashcam/{video_name}"
+    
+    if not os.path.exists(video_path):
+        return (
+            gr.Textbox(value="Video file not found", visible=True),
+            gr.Gallery(visible=False),
+            gr.File(visible=False),
+            gr.JSON(visible=False),
+            gr.Markdown("**Video file not found.**", visible=True),
+            gr.Textbox(value="No frame selected")
+        )
+    
+    try:
+        # Use the existing call_video_analysis function
+        result = call_video_analysis(video_path, task_type)
+        
+        # After processing, refresh the results display
+        result_folders = get_video_results_folders(video_name)
+        
+        if result_folders:
+            first_frame = result_folders[0]
+            images, json_data, json_file_path = load_frame_results(first_frame)
+            
+            return (
+                gr.Textbox(value=f"Processing completed successfully!\n\n{result}", visible=True),
+                gr.Gallery(value=images, visible=True if images else False),
+                gr.File(value=json_file_path, visible=True if json_file_path else False),
+                gr.JSON(value=json_data, visible=True if json_data else False),
+                gr.Markdown(visible=False),
+                gr.Textbox(value=f"Frame 1 of {len(result_folders)}: {first_frame}")
+            )
+        else:
+            return (
+                gr.Textbox(value=f"Processing completed, but no results found.\n\n{result}", visible=True),
+                gr.Gallery(visible=False),
+                gr.File(visible=False),
+                gr.JSON(visible=False),
+                gr.Markdown("**Processing completed but no results found.**", visible=True),
+                gr.Textbox(value="No frame selected")
+            )
+    
+    except Exception as e:
+        return (
+            gr.Textbox(value=f"Error processing video: {str(e)}", visible=True),
+            gr.Gallery(visible=False),
+            gr.File(visible=False),
+            gr.JSON(visible=False),
+            gr.Markdown("**Error occurred during processing.**", visible=True),
+            gr.Textbox(value="No frame selected")
+        )
+
+
+def navigate_frame(video_name, current_frame_info, direction):
+    """Navigate between frames for the selected video"""
+    if not video_name or not current_frame_info or current_frame_info == "No frame selected":
+        return (
+            gr.Gallery(visible=False),
+            gr.File(visible=False),
+            gr.JSON(visible=False),
+            gr.Textbox(value="No frame selected")
+        )
+    
+    result_folders = get_video_results_folders(video_name)
+    
+    if not result_folders:
+        return (
+            gr.Gallery(visible=False),
+            gr.File(visible=False),
+            gr.JSON(visible=False),
+            gr.Textbox(value="No frame selected")
+        )
+    
+    # Parse current frame number from frame_info
+    try:
+        current_frame_num = int(current_frame_info.split("Frame ")[1].split(" of ")[0])
+    except:
+        current_frame_num = 1
+    
+    # Calculate new frame number
+    if direction == "prev":
+        new_frame_num = max(1, current_frame_num - 1)
+    else:  # next
+        new_frame_num = min(len(result_folders), current_frame_num + 1)
+    
+    # Load the new frame's results
+    frame_folder = result_folders[new_frame_num - 1]
+    images, json_data, json_file_path = load_frame_results(frame_folder)
+    
+    return (
+        gr.Gallery(value=images, visible=True if images else False),
+        gr.File(value=json_file_path, visible=True if json_file_path else False),
+        gr.JSON(value=json_data, visible=True if json_data else False),
+        gr.Textbox(value=f"Frame {new_frame_num} of {len(result_folders)}: {frame_folder}")
+    )
 
 
 def _launch_demo(args, pipeline):
@@ -450,30 +705,123 @@ def _launch_demo(args, pipeline):
             # Tab 3: Video Processing
             with gr.TabItem("Video Processing"):
                 with gr.Row():
-                    with gr.Column():
-                        video_input = gr.Video(
-                            label="Upload Video"
+                    # Left side - Video list and controls
+                    with gr.Column(scale=1):
+                        gr.Markdown("### Available Videos")
+                        video_list = gr.Dropdown(
+                            label="Select Video",
+                            choices=[],
+                            value=None,
+                            interactive=True
                         )
+                        
+                        refresh_videos_btn = gr.Button("Refresh Video List", size="sm")
+                        
+                        with gr.Row():
+                            play_video_btn = gr.Button("Play Video", variant="secondary", size="sm")
+                            process_video_btn = gr.Button("Process Video", variant="primary", size="sm")
                         
                         video_task_type = gr.Radio(
                             choices=["description", "detection"],
-                            value="description",
+                            value="detection",
                             label="Analysis Type"
                         )
                         
-                        video_submit_btn = gr.Button("Process Video", variant="primary")
+                        # Video player (hidden by default)
+                        video_player = gr.Video(
+                            label="Video Player",
+                            visible=False
+                        )
                         
-                    with gr.Column():
-                        video_output = gr.Textbox(
-                            label="Video Analysis Results",
-                            lines=20,
-                            max_lines=30
+                        processing_status = gr.Textbox(
+                            label="Processing Status",
+                            lines=3,
+                            max_lines=5,
+                            visible=False
+                        )
+                    
+                    # Right side - Results display
+                    with gr.Column(scale=2):
+                        gr.Markdown("### Video Analysis Results")
+                        
+                        # Frame navigation
+                        with gr.Row():
+                            prev_frame_btn = gr.Button("← Previous Frame", size="sm")
+                            frame_info = gr.Textbox(
+                                label="Current Frame",
+                                value="No frame selected",
+                                interactive=False,
+                                scale=2
+                            )
+                            next_frame_btn = gr.Button("Next Frame →", size="sm")
+                        
+                        # Results display (similar to detection tab)
+                        results_gallery = gr.Gallery(
+                            label="Frame Analysis Results",
+                            show_label=True,
+                            elem_id="video_results_gallery",
+                            columns=2,
+                            rows=2,
+                            height=400,
+                            allow_preview=True,
+                            preview=True,
+                            visible=False
+                        )
+                        
+                        # JSON results
+                        results_json_file = gr.File(
+                            label="Frame Results JSON (Download)",
+                            visible=False,
+                            interactive=False
+                        )
+                        
+                        results_json_display = gr.JSON(
+                            label="JSON Annotations (Preview)",
+                            visible=False
+                        )
+                        
+                        # No results message
+                        no_results_msg = gr.Markdown(
+                            "**No processed results found for this video.**\n\nSelect a video and click 'Process Video' to generate analysis results.",
+                            visible=True
                         )
                 
-                video_submit_btn.click(
-                    fn=call_video_analysis,
-                    inputs=[video_input, video_task_type],
-                    outputs=video_output
+                # Event handlers
+                refresh_videos_btn.click(
+                    fn=refresh_video_list,
+                    outputs=video_list
+                )
+                
+                video_list.change(
+                    fn=on_video_selected,
+                    inputs=video_list,
+                    outputs=[results_gallery, results_json_file, results_json_display, 
+                            no_results_msg, frame_info, prev_frame_btn, next_frame_btn]
+                )
+                
+                play_video_btn.click(
+                    fn=play_selected_video,
+                    inputs=video_list,
+                    outputs=[video_player]
+                )
+                
+                process_video_btn.click(
+                    fn=process_selected_video,
+                    inputs=[video_list, video_task_type],
+                    outputs=[processing_status, results_gallery, results_json_file, 
+                            results_json_display, no_results_msg, frame_info]
+                )
+                
+                prev_frame_btn.click(
+                    fn=navigate_frame,
+                    inputs=[video_list, frame_info, gr.State("prev")],
+                    outputs=[results_gallery, results_json_file, results_json_display, frame_info]
+                )
+                
+                next_frame_btn.click(
+                    fn=navigate_frame,
+                    inputs=[video_list, frame_info, gr.State("next")],
+                    outputs=[results_gallery, results_json_file, results_json_display, frame_info]
                 )
 
     # Launch the demo

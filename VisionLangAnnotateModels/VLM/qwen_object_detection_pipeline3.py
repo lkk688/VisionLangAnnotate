@@ -3052,18 +3052,26 @@ RESULT_END"""
                                 os.close(temp_fd)
                                 frame_data['image'].save(frame_path, "JPEG", quality=95)
                             
+                            # Create frame-specific subfolder for saving results
+                            frame_save_folder = save_folder
+                            if save_results and save_folder and frame_data['frame_filename']:
+                                # Extract frame name without extension for folder name
+                                frame_name = os.path.splitext(frame_data['frame_filename'])[0]
+                                frame_save_folder = os.path.join(save_folder, frame_name)
+                                os.makedirs(frame_save_folder, exist_ok=True)
+                            
                             # Use appropriate detection method based on configuration
                             if self.enable_traditional_detectors:
                                 result = self.detect_objects_hybrid(
-                                    frame_path, save_results=False, 
+                                    frame_path, save_results=True, 
                                     use_sam_segmentation=use_sam_segmentation,
-                                    save_folder=save_folder
+                                    save_folder=frame_save_folder
                                 )
                             else:
                                 result = self.detect_objects(
-                                    frame_path, save_results=False,
+                                    frame_path, save_results=True,
                                     use_sam_segmentation=use_sam_segmentation, 
-                                    save_folder=save_folder
+                                    save_folder=frame_save_folder
                                 )
                             
                             batch_results.append(result)
@@ -3147,18 +3155,26 @@ RESULT_END"""
                         os.close(temp_fd)
                         frame_data['image'].save(frame_path, "JPEG", quality=95)
                     
+                    # Create frame-specific subfolder for saving results
+                    frame_save_folder = save_folder
+                    if save_results and save_folder and frame_data['frame_filename']:
+                        # Extract frame name without extension for folder name
+                        frame_name = os.path.splitext(frame_data['frame_filename'])[0]
+                        frame_save_folder = os.path.join(save_folder, frame_name)
+                        os.makedirs(frame_save_folder, exist_ok=True)
+                    
                     # Use appropriate detection method based on configuration
                     if self.enable_traditional_detectors:
                         result = self.detect_objects_hybrid(
-                            frame_path, save_results=False,
+                            frame_path, save_results=True,
                             use_sam_segmentation=use_sam_segmentation,
-                            save_folder=save_folder
+                            save_folder=frame_save_folder
                         )
                     else:
                         result = self.detect_objects(
-                            frame_path, save_results=False,
+                            frame_path, save_results=True,
                             use_sam_segmentation=use_sam_segmentation,
-                            save_folder=save_folder
+                            save_folder=frame_save_folder
                         )
                     
                     batch_results.append(result)
@@ -3632,7 +3648,8 @@ RESULT_END"""
 
 def video_example(pipeline, sample_image_path="./sample_image.jpg"):
     # Example: Process a video with both VLM-only and hybrid detection
-    video_path = "output/dashcam_videos/Parking compliance Vantrue dashcam/20250602_065600_00002_T_A.MP4"
+    #video_path = "output/dashcam_videos/Parking compliance Vantrue dashcam/20250602_065600_00002_T_A.MP4"
+    video_path = "output/dashcam_videos/Parking compliance Vantrue dashcam/20250602_092145_00018_T_A.MP4"
     
     # Check if video file exists, otherwise use sample image for demonstration
     if not os.path.exists(video_path):
@@ -3648,7 +3665,7 @@ def video_example(pipeline, sample_image_path="./sample_image.jpg"):
     
     print("\n=== Video Processing with VLM-only Detection ===")
     # Configure pipeline for VLM-only detection
-    pipeline.output_dir = "./output/qwen_video_results_vlm_only"
+    pipeline.output_dir = "./output/qwen_video_results"
     pipeline.enable_traditional_detectors = False
     os.makedirs(pipeline.output_dir, exist_ok=True)
     
@@ -3796,6 +3813,39 @@ def image_example(pipeline, image_path):
     else:
         print("\nNo objects detected in hybrid mode.")
 
+def simplevideo_example(pipeline, video_path):
+    # Example: Process a video with both VLM-only and hybrid detection
+    #video_path = "output/dashcam_videos/Parking compliance Vantrue dashcam/20250602_065600_00002_T_A.MP4"
+    
+    # Check if video file exists, otherwise use sample image for demonstration
+    if not os.path.exists(video_path):
+        print(f"Video file not found: {video_path}")
+        return None
+    
+    # Reuse existing pipeline and modify settings for different detection modes
+    # Save original settings
+    original_output_dir = pipeline.output_dir
+    original_enable_traditional = pipeline.enable_traditional_detectors
+    original_traditional_detectors = pipeline.traditional_detectors
+    
+    print("\n=== Video Processing with VLM-only Detection ===")
+    # Configure pipeline for VLM-only detection
+    pipeline.output_dir = "./output/qwen_video_results"
+    os.makedirs(pipeline.output_dir, exist_ok=True)
+    
+    if video_path.endswith(('.mp4', '.MP4', '.avi', '.AVI', '.mov', '.MOV')):
+        video_results_vlm = pipeline.process_video_frames(
+            video_path, 
+            extraction_method="scene_change", 
+            use_sam_segmentation=True,
+            save_results=True,
+            batch_size=1, 
+            save_folder=pipeline.output_dir
+        )
+        print(f"VLM-only video processing: {video_results_vlm['summary']['frames_extracted']} frames extracted")
+        print(f"Total objects detected: {video_results_vlm['summary']['total_objects_detected']}")
+
+
 def main():
     """
     Example usage of the QwenObjectDetectionPipeline.
@@ -3816,9 +3866,12 @@ def main():
     original_enable_traditional = pipeline.enable_traditional_detectors
     original_traditional_detectors = pipeline.traditional_detectors
     
+    #video_example(pipeline)
+    video_path = "output/dashcam_videos/Parking compliance Vantrue dashcam/20250602_092145_00018_T_A.MP4"
+    simplevideo_example(pipeline, video_path)
     image_path = "VisionLangAnnotateModels/sampledata/sj1.jpg"
     image_example(pipeline, image_path)
-    #video_example(pipeline)
+    
 
     
     # Restore original pipeline settings
