@@ -236,6 +236,12 @@ API documentation available at: `http://localhost:8000/docs`
 
 Modern, professional three-panel interface:
 
+![VLM Frontend Interface](docs/figures/UI1.png)
+*Three-panel VLM interface with interactive object detection visualization*
+
+![Object Detection with Hover](docs/figures/UI2.png)
+*Interactive hover synchronization between bounding boxes and object list*
+
 **Layout:**
 - **Left Panel**: Model controls (function selector, detection method, SAM toggle, image upload)
 - **Center Panel**: Image visualization with interactive SVG bounding boxes
