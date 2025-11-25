@@ -30,18 +30,139 @@ VisionLangAnnotate consists of two main components:
 Located in `VisionLangAnnotateModels/detectors/`, this component includes:
 
 - Multiple object detection models (DETR, YOLO, RT-DETR)
+- Unified inference interface (`ModelInference`)
 - Video processing pipeline (`videopipeline.py`)
 - Ensemble detection capabilities
 - Evaluation tools and metrics
 
-### 2. Vision-Language Models (VLM) Pipeline
+### 2. Vision-Language Models (VLM) Backend
 
-Located in `VisionLangAnnotateModels/VLM/`, this component includes:
+#### Unified VLM Classifier (`vlm_classifierv4.py`)
 
-- Zero-shot object detection with Grounding DINO and SAM (`groundingdinosam.py`)
-- Multi-model VLM pipeline (`vlmpipeline.py`)
-- Region captioning and classification
-- Support for various VLM providers (OpenAI, Ollama, vLLM, LiteLLM)
+The unified VLM backend provides a flexible interface for multiple Vision-Language Models with support for various backends:
+
+**Supported Model Architectures:**
+- **BLIP-2**: Salesforce/blip2-opt-2.7b, blip2-flan-t5-xxl
+- **LLaVA**: llava-hf/llava-1.5-7b-hf, llava-v1.6-mistral-7b-hf
+- **Qwen2.5-VL**: Qwen/Qwen2.5-VL-7B-Instruct (with Flash Attention 2 support)
+- **SmolVLM**: HuggingFaceTB/SmolVLM-Instruct
+- **GLM-4.5V/4.1V**: zai-org/GLM-4.5V (multimodal reasoning)
+
+**Backend Support:**
+- `HuggingFaceVLM`: Direct Transformers inference
+- `OpenAIVLM`: OpenAI API (GPT-4V, GPT-4o)
+- `OllamaVLM`: Local Ollama models
+- `vLLMBackend`: High-performance vLLM inference
+
+Example usage:
+```python
+from VisionLangAnnotateModels.VLM.vlm_classifierv4 import HuggingFaceVLM
+
+# Initialize with Qwen2.5-VL
+vlm = HuggingFaceVLM(
+    model_name="Qwen/Qwen2.5-VL-7B-Instruct",
+    device="cuda"
+)
+
+# Generate descriptions
+results = vlm.generate(
+    images=[image],
+    prompts=["Describe this image in detail"]
+)
+```
+
+#### Qwen Object Detection Pipeline (`qwen_object_detection_pipeline3.py`)
+
+Advanced object detection pipeline with hybrid fusion approaches:
+
+**Detection Modes:**
+1. **VLM-Only Detection**: Pure vision-language model detection
+   - Uses structured prompts for consistent bbox output
+   - Format: `Object_name: (x1,y1,x2,y2) confidence description`
+
+2. **Hybrid Mode** (Parallel Fusion):
+   - Combines VLM with traditional detectors (YOLO, DETR)
+   - Runs VLM and traditional detectors in parallel
+   - Ensemble fusion using NMS or Weighted Boxes Fusion (WBF)
+   - VLM provides descriptions for traditional detector bboxes
+
+3. **Hybrid-Sequential Mode**:
+   - Traditional detectors generate initial bboxes
+   - VLM processes cropped regions for detailed descriptions
+   - Optimized batch processing for multiple regions
+   - Higher accuracy with sequential validation
+
+**Key Features:**
+- SAM (Segment Anything Model) integration for precise segmentation
+- Multiple backend support (HuggingFace, vLLM, Ollama)
+- Smart box optimization and merging
+- Label Studio compatible JSON export
+- Comprehensive visualization with bbox, labels, and confidence scores
+
+Example usage:
+```python
+from VisionLangAnnotateModels.VLM.qwen_object_detection_pipeline3 import QwenObjectDetectionPipeline
+
+# Initialize with hybrid mode
+pipeline = QwenObjectDetectionPipeline(
+    model_name="Qwen/Qwen2.5-VL-7B-Instruct",
+    device="cuda",
+    enable_sam=True,
+    enable_traditional_detectors=True,
+    traditional_detectors=['yolo', 'detr'],
+    vlm_backend="huggingface"
+)
+
+# VLM-only detection
+results = pipeline.detect_objects(
+    "path/to/image.jpg",
+    use_sam_segmentation=True
+)
+
+# Hybrid detection (parallel)
+results = pipeline.detect_objects_hybrid(
+    "path/to/image.jpg",
+    use_sam_segmentation=True,
+    sequential_mode=False
+)
+
+# Hybrid-sequential detection
+results = pipeline.detect_objects_hybrid(
+    "path/to/image.jpg",
+    use_sam_segmentation=True,
+    sequential_mode=True
+)
+```
+
+**Fusion Approaches:**
+
+1. **Ensemble Fusion (NMS/WBF)**:
+   ```python
+   # Combines detections from multiple sources
+   # - Removes duplicates using IoU threshold
+   # - WBF weights boxes by confidence
+   # - Preserves bbox diversity
+   ensembled = ensemble_detections(
+       [traditional_dets, vlm_dets],
+       method='wbf',
+       iou_thr=0.5
+   )
+   ```
+
+2. **IoU-based Matching**:
+   ```python
+   # Matches VLM detections to traditional detections
+   # - Uses IoU threshold (default 0.3)
+   # - Prioritizes VLM descriptions for matched boxes
+   # - Keeps unmatched detections from both sources
+   ```
+
+3. **Overlap-based Matching**:
+   ```python
+   # More lenient matching using overlap ratio
+   # - Computes intersection over smaller box area
+   # - Better for nested or partially overlapping objects
+   ```
 
 ### 3. Annotation and Validation Pipeline
 
@@ -52,37 +173,267 @@ The project includes tools for exporting detection results to Label Studio:
 - Complete workflow from automatic detection to human validation and re-annotation
 - Feedback loop for continuous model improvement based on validated annotations
 
+## 🎨 User Interfaces
+
+### Gradio Application (`tools/gradio_vlm.py`)
+
+Interactive web interface for object detection and image analysis:
+
+**Features:**
+- **Image Description Tab**: Generate natural language descriptions with custom prompts
+- **Object Detection Tab**: 
+  - Three detection methods (VLM Only, Hybrid Mode, Hybrid-Sequential)
+  - SAM segmentation toggle
+  - Real-time visualization gallery
+  - JSON annotation download
+- **Video Processing Tab**:
+  - Video upload and playback
+  - Frame-by-frame analysis results
+  - Result browsing with prev/next navigation
+
+**Running the Gradio App:**
+```bash
+cd tools
+python gradio_vlm.py \
+  --checkpoint-path Qwen/Qwen2.5-VL-7B-Instruct \
+  --backend huggingface \
+  --server-port 7860
+```
+
+Visit `http://localhost:7860` to access the Gradio interface.
+
+### FastAPI Backend (`backend/`)
+
+Production-ready REST API for VLM operations:
+
+**Architecture:**
+- `src/main.py`: FastAPI application with CORS support
+- `src/models.py`: Pydantic models for request/response validation
+- `src/api/vlm.py`: VLM endpoint router (7 endpoints)
+- `src/pipeline.py`: Singleton pipeline management
+- `src/config.py`: Environment-based configuration
+
+**API Endpoints:**
+```
+GET  /api/vlm/backend-info              # Backend status
+POST /api/vlm/describe-image/{filename} # Image description
+POST /api/vlm/detect-objects/{filename} # Object detection
+POST /api/vlm/analyze-video/{filename}  # Video analysis
+GET  /api/vlm/visualization/{filename}  # Get visualization
+GET  /api/vlm/segmentation/{filename}   # Get segmentation
+GET  /api/vlm/annotation/{filename}     # Get JSON annotation
+```
+
+**Starting the Backend:**
+```bash
+cd backend
+uvicorn src.main:app --reload --host 0.0.0.0 --port 8000
+```
+
+API documentation available at: `http://localhost:8000/docs`
+
+### React Frontend (`frontend/`)
+
+Modern, professional three-panel interface:
+
+**Layout:**
+- **Left Panel**: Model controls (function selector, detection method, SAM toggle, image upload)
+- **Center Panel**: Image visualization with interactive SVG bounding boxes
+- **Right Panel**: Detailed output with two-level object hierarchy (class + description)
+
+**Interactive Features:**
+- Bidirectional hover synchronization between bboxes and object list
+- Smooth pulse animations on hover
+- Auto-scroll to hovered items
+- Glassmorphism design with modern color scheme
+- Fully responsive layout
+
+**Starting the Frontend:**
+```bash
+cd frontend
+npm install
+npm run dev
+```
+
+Visit `http://localhost:5173` to access the React interface.
+
+**Complete Stack Usage:**
+```bash
+# Terminal 1: Start FastAPI backend
+cd backend && uvicorn src.main:app --reload
+
+# Terminal 2: Start React frontend
+cd frontend && npm run dev
+
+# Access at http://localhost:5173
+```
+
 ## 🚀 Usage Examples
 
-### Object Detection with Natural Language
+### Using the Unified VLM Backend
 
 ```python
-from VisionLangAnnotateModels.VLM.vlmpipeline import VLMPipeline
+from VisionLangAnnotateModels.VLM.vlm_classifierv4 import HuggingFaceVLM
+from PIL import Image
 
-pipeline = VLMPipeline()
-results = pipeline.detect_with_prompt(
-    image_path="sampledata/bus.jpg",
-    prompt="Find all vehicles and count how many people are visible"
+# Initialize with Qwen2.5-VL (Flash Attention 2)
+vlm = HuggingFaceVLM(
+    model_name="Qwen/Qwen2.5-VL-7B-Instruct",
+    device="cuda"
 )
 
-# Visualize results
-pipeline.visualize_results(results, output_path="output.jpg")
+# Load image
+image = Image.open("path/to/image.jpg")
+
+# Generate description
+descriptions = vlm.generate(
+    images=[image],
+    prompts=["Describe this image in detail"]
+)
+print(descriptions[0])
+
+# Use other supported models
+# llava_vlm = HuggingFaceVLM("llava-hf/llava-1.5-7b-hf", "cuda")
+# glm_vlm = HuggingFaceVLM("zai-org/GLM-4.5V", "cuda")
 ```
 
-### Zero-Shot Object Detection
+### Qwen Object Detection - VLM Only Mode
 
 ```python
-from VisionLangAnnotateModels.VLM.groundingdinosam import GroundingDinoSamDetector
+from VisionLangAnnotateModels.VLM.qwen_object_detection_pipeline3 import QwenObjectDetectionPipeline
 
-# Initialize the zero-shot detector
-detector = GroundingDinoSamDetector()
+# Initialize pipeline with VLM-only mode
+pipeline = QwenObjectDetectionPipeline(
+    model_name="Qwen/Qwen2.5-VL-7B-Instruct",
+    device="cuda",
+    output_dir="./detection_results",
+    enable_sam=True,  # Enable SAM for segmentation
+    enable_traditional_detectors=False,  # VLM-only
+    vlm_backend="huggingface"
+)
 
-# Detect objects based on text prompt
-results = detector.detect(
+# Detect objects
+results = pipeline.detect_objects(
     image_path="path/to/image.jpg",
-    text_prompt="Find a red car and a person wearing a hat"
+    use_sam_segmentation=True,
+    save_results=True
 )
+
+# Access results
+print(f"Found {len(results['objects'])} objects")
+for obj in results['objects']:
+    print(f"{obj['label']}: {obj['bbox']} - {obj['description']}")
+
+# View visualization
+visualization_path = results['visualization_path']
 ```
+
+### Qwen Object Detection - Hybrid Parallel Mode
+
+```python
+# Initialize with traditional detectors
+pipeline = QwenObjectDetectionPipeline(
+    model_name="Qwen/Qwen2.5-VL-7B-Instruct",
+    device="cuda",
+    enable_sam=True,
+    enable_traditional_detectors=True,
+    traditional_detectors=['yolo', 'detr'],  # Multiple detectors
+    vlm_backend="huggingface"
+)
+
+# Hybrid detection (parallel fusion)
+results = pipeline.detect_objects_hybrid(
+    image_path="path/to/image.jpg",
+    use_sam_segmentation=True,
+    sequential_mode=False,  # Parallel mode
+    save_results=True
+)
+
+# Results include detections from VLM + YOLO + DETR
+# Fused using Weighted Boxes Fusion (WBF)
+print(f"Raw response: {results['raw_response']}")
+print(f"Visualization: {results['visualization_path']}")
+print(f"JSON annotations: {results['json_path']}")
+```
+
+### Qwen Object Detection - Hybrid Sequential Mode
+
+```python
+# Sequential mode: Traditional detectors → VLM validation
+results = pipeline.detect_objects_hybrid(
+    image_path="path/to/image.jpg",
+    use_sam_segmentation=True,
+    sequential_mode=True,  # Sequential mode
+    cropped_sequential_mode=False,
+    save_results=True
+)
+
+# In sequential mode:
+# 1. Traditional detectors generate initial bboxes
+# 2. VLM processes each cropped region
+# 3. VLM provides detailed descriptions
+# 4. Higher accuracy with validation
+
+# Access segmentation masks (if SAM enabled)
+if results.get('segmentation_path'):
+    print(f"Segmentation: {results['segmentation_path']}")
+```
+
+### Using the FastAPI Backend
+
+```python
+import requests
+
+# Upload image
+files = {'file': open('image.jpg', 'rb')}
+upload_response = requests.post('http://localhost:8000/api/upload', files=files)
+filename = upload_response.json()['filename']
+
+# Image description
+desc_response = requests.post(
+    f'http://localhost:8000/api/vlm/describe-image/{filename}',
+    json={'custom_prompt': 'What is in this image?'}
+)
+print(desc_response.json()['description'])
+
+# Object detection (Hybrid mode)
+det_response = requests.post(
+    f'http://localhost:8000/api/vlm/detect-objects/{filename}',
+    json={
+        'detection_method': 'Hybrid Mode',
+        'use_sam_segmentation': True
+    }
+)
+
+results = det_response.json()
+print(f"Detected {results['num_objects']} objects")
+for obj in results['objects']:
+    print(f"{obj['label']}: {obj['description']}")
+
+# Download visualization
+viz_url = f"http://localhost:8000/api/vlm/visualization/{results['visualization_paths'][0]}"
+```
+
+### Using the Gradio Interface
+
+```bash
+# Start Gradio app with Qwen model
+python tools/gradio_vlm.py \
+  --checkpoint-path Qwen/Qwen2.5-VL-7B-Instruct \
+  --backend huggingface \
+  --enable-sam \
+  --enable-traditional-detectors \
+  --traditional-detectors yolo,detr \
+  --server-port 7860
+```
+
+Then open `http://localhost:7860` in your browser:
+1. Upload an image
+2. Select detection mode (VLM Only, Hybrid, or Hybrid-Sequential)
+3. Toggle SAM segmentation
+4. Click "Detect Objects"
+5. View results in the gallery
+6. Download JSON annotations
 
 ### Video Processing
 
@@ -201,6 +552,14 @@ pip install mkdocs mkdocs-material
 #test backend
 uvicorn src.main:app --reload
 #Verify at: http://localhost:8000
+```
+
+```bash
+# Frontend (runs on localhost:5173)
+cd frontend && npm run dev
+
+# Backend (runs on localhost:8000)
+uvicorn backend.src.main:app --reload
 ```
 
 ## ⚠️ Common Warnings and Solutions
@@ -382,24 +741,3 @@ VisionLangAnnotate creates a complete annotation workflow:
 
 This closed-loop system combines the efficiency of automatic detection with the accuracy of human validation, creating a powerful tool for building high-quality annotated datasets.
 
-## 🤝 Contributing
-
-Contributions are welcome! Here's how you can help:
-
-1. Fork the repository
-2. Create a feature branch (`git checkout -b feature/amazing-feature`)
-3. Commit your changes (`git commit -m 'Add some amazing feature'`)
-4. Push to the branch (`git push origin feature/amazing-feature`)
-5. Open a Pull Request
-
-## 📄 License
-
-This project is licensed under the MIT License - see the LICENSE file for details.
-
-## 📞 Contact
-
-For questions or feedback, please open an issue on GitHub or contact the maintainers directly.
-
----
-
-<p align="center">Built with ❤️ for the computer vision and AI community</p>

@@ -2,6 +2,7 @@ from fastapi import APIRouter, HTTPException
 from fastapi.responses import FileResponse
 from pathlib import Path
 import glob
+import os
 from ..config import UPLOAD_FOLDER, ALLOWED_EXTENSIONS
 from ..utils import allowed_file
 

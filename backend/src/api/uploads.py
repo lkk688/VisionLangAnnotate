@@ -1,35 +1,33 @@
 from fastapi import APIRouter, UploadFile, File, HTTPException
 from pathlib import Path
+import os
+import json
 from ..config import UPLOAD_FOLDER, ANNOTATION_FOLDER
 from ..utils import allowed_file
 
 router = APIRouter(prefix="/upload", tags=["Uploads"])
 
 @router.post("/")
-async def upload_file(files: list[UploadFile] = File(...)):
-    """Upload image files"""
-    if not files:
-        raise HTTPException(status_code=400, detail="No files provided")
+async def upload_file(file: UploadFile = File(...)):
+    """Upload a single image file"""
+    if not file:
+        raise HTTPException(status_code=400, detail="No file provided")
     
-    uploaded_count = 0
-    uploaded_files = []
+    if not allowed_file(file.filename):
+        raise HTTPException(status_code=400, detail="File type not allowed")
     
-    for file in files:
-        if file and allowed_file(file.filename):
-            filename = file.filename.replace(" ", "_")  # Simple filename sanitization
-            file_path = os.path.join(UPLOAD_FOLDER, filename)
-            
-            # Save the file
-            with open(file_path, "wb") as buffer:
-                buffer.write(await file.read())
-            
-            uploaded_count += 1
-            uploaded_files.append(filename)
+    # Simple filename sanitization
+    filename = file.filename.replace(" ", "_")
+    file_path = UPLOAD_FOLDER / filename
+    
+    # Save the file
+    with open(file_path, "wb") as buffer:
+        buffer.write(await file.read())
     
     return {
         'success': True,
-        'uploaded': uploaded_count,
-        'filenames': uploaded_files
+        'filename': filename,
+        'uploaded': 1
     }
 
 @router.post("/upload-annotation")

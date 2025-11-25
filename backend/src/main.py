@@ -2,7 +2,7 @@ from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from pathlib import Path
-from .api import health, images, annotations, uploads
+from .api import health, images, annotations, uploads, vlm
 
 
 # Create FastAPI app
@@ -37,6 +37,7 @@ app.include_router(health.router)
 app.include_router(images.router, prefix="/api")
 app.include_router(annotations.router, prefix="/api")
 app.include_router(uploads.router, prefix="/api")
+app.include_router(vlm.router, prefix="/api")
 
 
     
